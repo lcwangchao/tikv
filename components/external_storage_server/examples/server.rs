@@ -21,7 +21,7 @@ fn create_s3_storage() -> external_storage::S3Storage {
 
 fn create_service() -> impl ExternalStorage + Send + Clone + 'static {
     let mut service = DefaultExternalStorageService::new();
-    service.register_store("s3".to_owned(), "s3".to_owned(), create_s3_storage());
+    service.register_store("s3", "s3", create_s3_storage());
 
     RpcExternalStorage::new(service)
 }

@@ -11,18 +11,27 @@ pub type RpcErrResult<T> = std::result::Result<T, ::grpcio::Error>;
 #[macro_export]
 macro_rules! impl_external_storage {
     (
-        $(#[$outer:meta])*
+        $(#[$service_outer:meta])*
         pub trait $ServiceName:ident {
             $(
-                async fn $fn_name:ident(&self, req: $RequestType:ident) -> RpcStatusResult<$ResponseType:ident>;
+                async fn $service_fn_name:ident(&self, req: $ServiceRequestType:ident) -> RpcStatusResult<$ServiceResponseType:ident>;
             )+
         }
-    ) => {
 
-        $(#[$outer])*
+        $(#[$raw_client_outer:meta])*
+        pub trait $RawClientName:ident {
+            async fn $raw_client_fn_name:ident(&self, req: &$RawClientRequestType:ident) -> RpcErrResult<$RawClientResponseType:ident>;
+        }
+
+        $(#[$client_outer:meta])*
+        pub struct $ClientName:ident {
+            $ref_raw_client:ident: Box<dyn $RefRawClientName:ident + Send + Sync>
+        }
+    ) => {
+        $(#[$service_outer])*
         pub trait $ServiceName {
             $(
-                async fn $fn_name(&self, req: $RequestType) -> RpcStatusResult<$ResponseType>;
+                async fn $service_fn_name(&self, req: $ServiceRequestType) -> RpcStatusResult<$ServiceResponseType>;
             )*
 
             async fn call(&self, req: CallRequest) -> RpcStatusResult<CallResponse> {
@@ -44,9 +53,9 @@ macro_rules! impl_external_storage {
                 let mut inner_resp = CallResponseResponse::new();
                 inner_resp.message = match message.unwrap() {
                     $(
-                        CallRequest_Request_oneof_message::$RequestType(inner_req) => { 
-                            Some(CallResponse_Response_oneof_message::$ResponseType(
-                                self.$fn_name(inner_req).await?
+                        CallRequest_Request_oneof_message::$ServiceRequestType(inner_req) => { 
+                            Some(CallResponse_Response_oneof_message::$ServiceResponseType(
+                                self.$service_fn_name(inner_req).await?
                             ))
                         }
                     )*
@@ -59,18 +68,34 @@ macro_rules! impl_external_storage {
             }
         }
 
-        impl ExternalStorageClient {
+        $(#[$raw_client_outer])*
+        pub trait $RawClientName {
+            async fn $raw_client_fn_name(&self, req: &$RawClientRequestType) -> RpcErrResult<$RawClientResponseType>;
+        }
+
+        $(#[$client_outer])*
+        pub struct $ClientName {
+            $ref_raw_client: Box<dyn $RefRawClientName + Send + Sync>
+        }
+
+        impl $ClientName {
+            pub fn new(client: impl $RefRawClientName + Send + Sync + 'static) -> Self {
+                Self {
+                    client: Box::new(client)
+                }
+            }
+
             $(
-                pub async fn $fn_name(&self, req: &$RequestType) -> RpcErrResult<$ResponseType> {
+                pub async fn $service_fn_name(&self, req: &$ServiceRequestType) -> RpcErrResult<$ServiceResponseType> {
                     let mut inner_req = CallRequestRequest::new();
                     inner_req.message = Some(
-                        CallRequest_Request_oneof_message::$RequestType(req.clone())
+                        CallRequest_Request_oneof_message::$ServiceRequestType(req.clone())
                     );
             
                     let mut call_req = CallRequest::new();
                     call_req.set_request(inner_req);
             
-                    let call_resp = self.client.call(&call_req).await?;
+                    let call_resp = self.$ref_raw_client.$raw_client_fn_name(&call_req).await?;
                     if !call_resp.has_response() {
                         return Err(::grpcio::Error::RpcFailure(::grpcio::RpcStatus::new(
                             ::grpcio::RpcStatusCode::INTERNAL,
@@ -87,7 +112,7 @@ macro_rules! impl_external_storage {
                     }
             
                     match message.unwrap() {
-                        CallResponse_Response_oneof_message::$ResponseType(inner_resp) => { 
+                        CallResponse_Response_oneof_message::$ServiceResponseType(inner_resp) => { 
                             Ok(inner_resp)
                         }
                         _ => {
@@ -103,23 +128,6 @@ macro_rules! impl_external_storage {
     }
 }
 
-#[async_trait]
-pub trait ExternalStorageRawClient {
-    async fn call(&self, req: &CallRequest) -> RpcErrResult<CallResponse>;
-}
-
-pub struct ExternalStorageClient {
-    client: Box<dyn ExternalStorageRawClient>
-}
-
-impl ExternalStorageClient {
-    pub fn new(client: impl ExternalStorageRawClient + 'static) -> Self {
-        Self {
-            client: Box::new(client)
-        }
-    }
-}
-
 impl_external_storage!(
     #[async_trait]
     pub trait ExternalStorageService {
@@ -130,5 +138,14 @@ impl_external_storage!(
         async fn upload_part(&self, req: UploadPartRequest) -> RpcStatusResult<UploadPartResponse>;
         async fn complete_upload(&self, req: CompleteUploadRequest) -> RpcStatusResult<CompleteUploadResponse>;
         async fn abort_upload(&self, req: AbortUploadRequest) -> RpcStatusResult<AbortUploadResponse>;
+    }
+
+    #[async_trait]
+    pub trait ExternalStorageRawClient {
+        async fn call(&self, req: &CallRequest) -> RpcErrResult<CallResponse>;
+    }
+
+    pub struct ExternalStorageClient {
+        client: Box<dyn ExternalStorageRawClient + Send + Sync>
     }
 );

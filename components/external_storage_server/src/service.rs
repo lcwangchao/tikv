@@ -47,15 +47,15 @@ impl DefaultExternalStorageService {
 
     pub fn register_store<T: AsyncExternalStorage>(
         &mut self,
-        store_id: String,
-        provider: String,
+        store_id: &str,
+        provider: &str,
         store: T,
     ) {
         let mut storages = self.storages.lock().unwrap();
         let wrapper = StoreWrapper {
             store: Arc::new(store),
-            store_id,
-            provider,
+            store_id: store_id.to_owned(),
+            provider: provider.to_owned(),
         };
 
         storages.insert(wrapper.store_id.clone(), wrapper);

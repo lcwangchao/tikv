@@ -2,10 +2,12 @@ use std::sync::Arc;
 
 use external_storage_server::{ExternalStorageClient};
 use external_storage_server::service::DefaultExternalStorageService;
-use external_storage_server::direct::DirectRawClient;
+use external_storage_server::direct::new_direct_client;
+use external_storage_server::grpc::new_rpc_client;
+
 use grpcio::{ChannelBuilder, EnvBuilder};
 use kvproto::extstorepb::{
-    ExternalStorageClient as RpcRawClient, GetStoreRequest, ListStoreRequest, Store,
+    GetStoreRequest, ListStoreRequest, Store,
     WriteFileRequest,
 };
 
@@ -13,32 +15,29 @@ fn build_rpc_client() -> ExternalStorageClient {
     let env = Arc::new(EnvBuilder::new().build());
     let ch = ChannelBuilder::new(env).connect("localhost:50051");
 
-    ExternalStorageClient::new(RpcRawClient::new(ch))
-}
-
-fn create_s3_storage() -> external_storage::S3Storage {
-    let mut config = kvproto::backup::S3::new();
-    config.set_endpoint("http://127.0.0.1:9000".to_owned());
-    config.set_access_key("minioadmin".to_owned());
-    config.set_secret_access_key("minioadmin".to_owned());
-    config.set_bucket("mytest".to_owned());
-    config.set_prefix("backups".to_owned());
-
-    external_storage::S3Storage::new(&config).unwrap()
+    new_rpc_client(ch)
 }
 
 fn build_direct_client() -> ExternalStorageClient {
     let mut service = DefaultExternalStorageService::new();
-    service.register_store("s3".to_owned(), "s3".to_owned(), create_s3_storage());
 
-    ExternalStorageClient::new(DirectRawClient::new(service))
+    service.register_store("s3", "s3", {
+        let mut config = kvproto::backup::S3::new();
+        config.set_endpoint("http://127.0.0.1:9000".to_owned());
+        config.set_access_key("minioadmin".to_owned());
+        config.set_secret_access_key("minioadmin".to_owned());
+        config.set_bucket("mytest".to_owned());
+        config.set_prefix("backups".to_owned());
+        external_storage::S3Storage::new(&config).unwrap()
+    });
+    
+    new_direct_client(service)
 }
 
 fn fmt_store(store: &Store) -> String {
     format!(
-        "Store: {}, driver: {}, provider: {}",
+        "Store: {}, provider: {}",
         store.get_id(),
-        store.get_driver(),
         store.get_provider()
     )
 }
@@ -75,7 +74,7 @@ pub async fn write_file(client: &ExternalStorageClient, store_id: &str) {
 fn main() {
     let mut rt = ::tokio::runtime::Runtime::new().unwrap();
 
-    let client = build_rpc_client();
+    let client = build_direct_client();
 
     let task = write_file(&client, "s3");
 

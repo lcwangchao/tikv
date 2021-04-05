@@ -1,9 +1,9 @@
-use crate::{ExternalStorageService, ExternalStorageRawClient};
+use crate::{ExternalStorageService, ExternalStorageRawClient, ExternalStorageClient};
 use std::sync::Arc;
 use async_trait::async_trait;
 
 use kvproto::extstorepb::{CallRequest, CallResponse};
-use kvproto::extstorepb_grpc::{ExternalStorage, ExternalStorageClient};
+use kvproto::extstorepb_grpc::{ExternalStorage, ExternalStorageClient as PbRpcClient};
 
 #[derive(Clone)]
 pub struct RpcExternalStorage<T: ExternalStorageService> {
@@ -39,11 +39,27 @@ impl<T: ExternalStorageService + Send + Sync + Clone + 'static> ExternalStorage 
     }
 }
 
-pub type RpcRawClient = ExternalStorageClient;
+struct RpcRawClient {
+    client: PbRpcClient
+}
+
+impl RpcRawClient {
+    fn new(channel: ::grpcio::Channel) -> Self {
+        Self {
+            client: PbRpcClient::new(channel)
+        }
+    }
+}
 
 #[async_trait]
 impl ExternalStorageRawClient for RpcRawClient {
     async fn call(&self, req: &CallRequest) -> crate::RpcErrResult<CallResponse> {
-        Ok(self.call_async(req)?.await?)
+        Ok(self.client.call_async(req)?.await?)
     }
+}
+
+pub fn new_rpc_client(channel: ::grpcio::Channel) -> ExternalStorageClient {
+    ExternalStorageClient::new(
+        RpcRawClient::new(channel)
+    )
 }
