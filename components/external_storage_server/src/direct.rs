@@ -1,0 +1,43 @@
+use async_trait::async_trait;
+use kvproto::extstorepb::{CallRequest, CallResponse};
+
+use crate::{ExternalStorageRawClient, ExternalStorageService};
+
+pub struct DirectRawClient<T: ExternalStorageService> {
+    service: T
+}
+
+impl<T: ExternalStorageService> DirectRawClient<T> {
+    pub fn new(service: T) -> Self {
+        Self {
+            service
+        }
+    }
+
+    fn marshal<M: ::protobuf::Message>(&self, message: &M) -> crate::RpcErrResult<Vec<u8>> {
+        match message.write_to_bytes() {
+            Ok(bytes) => Ok(bytes),
+            Err(err) => Err(::grpcio::Error::Codec(Box::new(err)))
+        }
+    }
+
+    fn unmarshal<M: ::protobuf::Message>(&self, buf: &[u8]) -> crate::RpcErrResult<M> {
+        match ::protobuf::parse_from_bytes::<M>(buf) {
+            Ok(message) => Ok(message),
+            Err(err) => Err(::grpcio::Error::Codec(Box::new(err)))
+        }
+    }
+}
+
+#[async_trait]
+impl<T: ExternalStorageService + Send + Sync + Clone + 'static> ExternalStorageRawClient for DirectRawClient<T> {
+    async fn call(&self, req: &CallRequest) -> crate::RpcErrResult<CallResponse> {
+        let bytes = self.marshal(req)?;
+        let req: CallRequest = self.unmarshal(bytes.as_slice())?;
+
+        match self.service.call(req).await {
+            Ok(res) => Ok(res),
+            Err(err) => Err(::grpcio::Error::RpcFailure(err))
+        }
+    }
+}

@@ -1,5 +1,6 @@
 pub mod service;
 pub mod grpc;
+pub mod direct;
 
 use async_trait::async_trait;
 use kvproto::extstorepb::*;
@@ -23,48 +24,42 @@ macro_rules! impl_external_storage {
             $(
                 async fn $fn_name(&self, req: $RequestType) -> RpcStatusResult<$ResponseType>;
             )*
+
+            async fn call(&self, req: CallRequest) -> RpcStatusResult<CallResponse> {
+                if !req.has_request() {
+                    return Err(::grpcio::RpcStatus::new(
+                        ::grpcio::RpcStatusCode::INVALID_ARGUMENT,
+                        Some("request message is empty".to_owned())
+                    ));
+                }
+            
+                let message = req.request.unwrap().message;
+                if message.is_none() {
+                    return Err(::grpcio::RpcStatus::new(
+                        ::grpcio::RpcStatusCode::INVALID_ARGUMENT,
+                        Some("request message is empty".to_owned())
+                    ));
+                }
+            
+                let mut inner_resp = CallResponseResponse::new();
+                inner_resp.message = match message.unwrap() {
+                    $(
+                        CallRequest_Request_oneof_message::$RequestType(inner_req) => { 
+                            Some(CallResponse_Response_oneof_message::$ResponseType(
+                                self.$fn_name(inner_req).await?
+                            ))
+                        }
+                    )*
+                };
+            
+                let mut resp = CallResponse::new();
+                resp.set_request_id(req.request_id);
+                resp.set_response(inner_resp);
+                Ok(resp)
+            }
         }
 
-        pub(crate) async fn call_external_storage_service<T>(
-            service: &T,
-            req: CallRequest,
-        ) -> RpcStatusResult<CallResponse>
-        where
-            T: ExternalStorageService,
-        {
-            if !req.has_request() {
-                return Err(::grpcio::RpcStatus::new(
-                    ::grpcio::RpcStatusCode::INVALID_ARGUMENT,
-                    Some("request message is empty".to_owned())
-                ));
-            }
-        
-            let message = req.request.unwrap().message;
-            if message.is_none() {
-                return Err(::grpcio::RpcStatus::new(
-                    ::grpcio::RpcStatusCode::INVALID_ARGUMENT,
-                    Some("request message is empty".to_owned())
-                ));
-            }
-        
-            let mut inner_resp = CallResponseResponse::new();
-            inner_resp.message = match message.unwrap() {
-                $(
-                    CallRequest_Request_oneof_message::$RequestType(inner_req) => { 
-                        Some(CallResponse_Response_oneof_message::$ResponseType(
-                            service.$fn_name(inner_req).await?
-                        ))
-                    }
-                )*
-            };
-        
-            let mut resp = CallResponse::new();
-            resp.set_request_id(req.request_id);
-            resp.set_response(inner_resp);
-            Ok(resp)
-        }
-
-        impl<T: ExternalStorageRawClient + Send + Sync> ExternalStorageClient<T> {
+        impl ExternalStorageClient {
             $(
                 pub async fn $fn_name(&self, req: &$RequestType) -> RpcErrResult<$ResponseType> {
                     let mut inner_req = CallRequestRequest::new();
@@ -75,7 +70,7 @@ macro_rules! impl_external_storage {
                     let mut call_req = CallRequest::new();
                     call_req.set_request(inner_req);
             
-                    let call_resp = self.client.raw_call(&call_req).await?;
+                    let call_resp = self.client.call(&call_req).await?;
                     if !call_resp.has_response() {
                         return Err(::grpcio::Error::RpcFailure(::grpcio::RpcStatus::new(
                             ::grpcio::RpcStatusCode::INTERNAL,
@@ -110,17 +105,17 @@ macro_rules! impl_external_storage {
 
 #[async_trait]
 pub trait ExternalStorageRawClient {
-    async fn raw_call(&self, req: &CallRequest) -> RpcErrResult<CallResponse>;
+    async fn call(&self, req: &CallRequest) -> RpcErrResult<CallResponse>;
 }
 
-pub struct ExternalStorageClient<T: ExternalStorageRawClient> {
-    client: T
+pub struct ExternalStorageClient {
+    client: Box<dyn ExternalStorageRawClient>
 }
 
-impl<T: ExternalStorageRawClient> ExternalStorageClient<T> {
-    pub fn new(client: T) -> Self {
+impl ExternalStorageClient {
+    pub fn new(client: impl ExternalStorageRawClient + 'static) -> Self {
         Self {
-            client
+            client: Box::new(client)
         }
     }
 }

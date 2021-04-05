@@ -1,4 +1,4 @@
-use crate::{ExternalStorageService, ExternalStorageRawClient, call_external_storage_service};
+use crate::{ExternalStorageService, ExternalStorageRawClient};
 use std::sync::Arc;
 use async_trait::async_trait;
 
@@ -31,8 +31,7 @@ impl<T: ExternalStorageService + Send + Sync + Clone + 'static> ExternalStorage 
     ) {
         let service = self.service.clone();
         self.runtime.spawn(async move {
-            // let res = call_external_storage_service(service.as_ref(), req).await;
-            match call_external_storage_service(&service, req).await {
+            match service.call(req).await {
                 Ok(res) => sink.success(res),
                 Err(err) => sink.fail(err)
             }
@@ -44,7 +43,7 @@ pub type RpcRawClient = ExternalStorageClient;
 
 #[async_trait]
 impl ExternalStorageRawClient for RpcRawClient {
-    async fn raw_call(&self, req: &CallRequest) -> crate::RpcErrResult<CallResponse> {
+    async fn call(&self, req: &CallRequest) -> crate::RpcErrResult<CallResponse> {
         Ok(self.call_async(req)?.await?)
     }
 }
