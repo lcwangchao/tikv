@@ -16,6 +16,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use futures::future;
 use futures_io::AsyncRead;
 #[cfg(feature = "protobuf-codec")]
 use kvproto::backup::StorageBackend_oneof_backend as Backend;
@@ -33,6 +34,8 @@ mod gcs;
 pub use gcs::GCSStorage;
 mod metrics;
 use metrics::*;
+
+type AsyncResult<'a, T> = future::BoxFuture<'a, io::Result<T>>;
 
 /// Create a new storage from the given storage backend description.
 pub fn create_storage(backend: &StorageBackend) -> io::Result<Arc<dyn ExternalStorage>> {
@@ -156,9 +159,41 @@ pub fn make_gcs_backend(config: Gcs) -> StorageBackend {
     }
 }
 
+pub trait AsyncUploader: 'static + Send + Sync {
+    fn begin_async<'a>(&'a self) -> AsyncResult<'a, ()>;
+    fn upload_part_async<'a>(&'a self, part_number: i64, data: &'a [u8]) -> AsyncResult<'a, ()>;
+    fn complete_async<'a>(&'a self) -> AsyncResult<'a, ()>;
+    fn abort_async<'a>(&'a self) -> AsyncResult<'a, ()>;
+}
+
+pub trait AsyncExternalStorage: 'static + Send + Sync {
+    fn create_uploader(&self, name: &str) -> Arc<dyn AsyncUploader>;
+    fn write_async<'a>(
+        &'a self,
+        name: &'a str,
+        reader: Box<dyn AsyncRead + Send + Unpin + 'a>,
+        content_length: u64,
+    ) -> AsyncResult<'a, ()>;
+}
+
+impl AsyncExternalStorage for Arc<dyn AsyncExternalStorage> {
+    fn create_uploader(&self, name: &str) -> Arc<dyn AsyncUploader> {
+        (**self).create_uploader(name)
+    }
+
+    fn write_async<'a>(
+        &'a self,
+        name: &'a str,
+        reader: Box<dyn AsyncRead + Send + Unpin + 'a>,
+        content_length: u64,
+    ) -> AsyncResult<'a, ()> {
+        (**self).write_async(name, reader, content_length)
+    }
+}
+
 /// An abstraction of an external storage.
 // TODO: these should all be returning a future (i.e. async fn).
-pub trait ExternalStorage: 'static {
+pub trait ExternalStorage: 'static + Send + Sync {
     /// Write all contents of the read to the given path.
     fn write(
         &self,

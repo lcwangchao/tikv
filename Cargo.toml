@@ -260,6 +260,7 @@ members = [
   "components/tidb_query_executors",
   "components/pd_client",
   "components/external_storage",
+  "components/external_storage_server",
   "components/cloud",
   "components/cloud/aws",
   "components/backup",

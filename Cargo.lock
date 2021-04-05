@@ -181,7 +181,7 @@ dependencies = [
  "http",
  "hyper",
  "hyper-tls",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "matches",
  "rusoto_core",
  "rusoto_credential",
@@ -236,7 +236,7 @@ dependencies = [
  "grpcio",
  "hex 0.4.2",
  "keys",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "lazy_static",
  "log_wrappers",
  "pd_client",
@@ -504,7 +504,7 @@ dependencies = [
  "fail",
  "futures 0.3.7",
  "grpcio",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "lazy_static",
  "log_wrappers",
  "panic_hook",
@@ -606,7 +606,7 @@ dependencies = [
  "derive_more",
  "error_code",
  "futures-io",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "openssl",
  "protobuf",
  "rusoto_core",
@@ -665,7 +665,7 @@ dependencies = [
  "grpcio",
  "hex 0.4.2",
  "keys",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "libc 0.2.86",
  "log",
  "log_wrappers",
@@ -1203,7 +1203,7 @@ dependencies = [
  "futures 0.3.7",
  "futures-util",
  "hex 0.4.2",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "lazy_static",
  "matches",
  "openssl",
@@ -1233,7 +1233,7 @@ dependencies = [
  "encryption",
  "error_code",
  "file_system",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "openssl",
  "protobuf",
  "rust-ini",
@@ -1248,7 +1248,7 @@ name = "engine_panic"
 version = "0.0.1"
 dependencies = [
  "engine_traits",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "raft",
  "tikv_alloc",
  "tikv_util",
@@ -1266,7 +1266,7 @@ dependencies = [
  "fail",
  "file_system",
  "keys",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "lazy_static",
  "log_wrappers",
  "num_cpus",
@@ -1306,7 +1306,7 @@ version = "0.0.1"
 dependencies = [
  "error_code",
  "file_system",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "log_wrappers",
  "protobuf",
  "raft",
@@ -1346,7 +1346,7 @@ name = "error_code"
 version = "0.0.1"
 dependencies = [
  "grpcio",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "lazy_static",
  "raft",
  "serde",
@@ -1358,6 +1358,7 @@ dependencies = [
 name = "external_storage"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
  "bytes 0.5.3",
  "futures 0.3.7",
  "futures-executor",
@@ -1367,7 +1368,7 @@ dependencies = [
  "http",
  "hyper",
  "hyper-tls",
- "kvproto",
+ "kvproto 0.0.2",
  "lazy_static",
  "matches",
  "prometheus",
@@ -1388,6 +1389,21 @@ dependencies = [
  "tikv_util",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "external_storage_server"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "external_storage",
+ "futures 0.3.7",
+ "futures-io",
+ "grpcio",
+ "kvproto 0.0.2",
+ "protobuf",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -2010,7 +2026,7 @@ name = "into_other"
 version = "0.0.1"
 dependencies = [
  "engine_traits",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "raft",
 ]
 
@@ -2106,12 +2122,26 @@ name = "keys"
 version = "0.1.0"
 dependencies = [
  "byteorder",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "log_wrappers",
  "panic_hook",
  "thiserror",
  "tikv_alloc",
  "tikv_util",
+]
+
+[[package]]
+name = "kvproto"
+version = "0.0.2"
+dependencies = [
+ "futures 0.3.7",
+ "grpcio",
+ "lazy_static",
+ "prost",
+ "prost-derive",
+ "protobuf",
+ "protobuf-build",
+ "raft-proto",
 ]
 
 [[package]]
@@ -2923,7 +2953,7 @@ dependencies = [
  "fail",
  "futures 0.3.7",
  "grpcio",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "lazy_static",
  "log",
  "log_wrappers",
@@ -3470,7 +3500,7 @@ version = "0.0.1"
 dependencies = [
  "configuration",
  "engine_traits",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "lazy_static",
  "num_cpus",
  "protobuf",
@@ -3509,7 +3539,7 @@ dependencies = [
  "futures-util",
  "into_other",
  "keys",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "lazy_static",
  "log",
  "log_wrappers",
@@ -3866,7 +3896,7 @@ dependencies = [
  "futures 0.3.7",
  "grpcio",
  "hex 0.4.2",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "log_wrappers",
  "pd_client",
  "prost",
@@ -4496,7 +4526,7 @@ dependencies = [
  "futures-util",
  "grpcio",
  "keys",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "lazy_static",
  "log_wrappers",
  "prometheus",
@@ -4819,7 +4849,7 @@ dependencies = [
  "futures-executor",
  "futures-util",
  "grpcio",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "rand 0.7.3",
  "tempfile",
  "test_raftstore",
@@ -4837,7 +4867,7 @@ dependencies = [
  "concurrency_manager",
  "engine_rocks",
  "futures 0.3.7",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "protobuf",
  "test_storage",
  "tidb_query_common",
@@ -4856,7 +4886,7 @@ dependencies = [
  "fail",
  "futures 0.3.7",
  "grpcio",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "pd_client",
  "security",
  "slog",
@@ -4878,7 +4908,7 @@ dependencies = [
  "futures 0.3.7",
  "grpcio",
  "keys",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "lazy_static",
  "log_wrappers",
  "pd_client",
@@ -4905,7 +4935,7 @@ dependencies = [
  "engine_rocks",
  "engine_traits",
  "keys",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "uuid",
 ]
 
@@ -4915,7 +4945,7 @@ version = "0.0.1"
 dependencies = [
  "collections",
  "futures 0.3.7",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "pd_client",
  "raftstore",
  "test_raftstore",
@@ -4932,7 +4962,7 @@ dependencies = [
  "encryption_export",
  "fail",
  "grpcio",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "rand 0.7.3",
  "rand_isaac 0.2.0",
  "security",
@@ -4971,7 +5001,7 @@ dependencies = [
  "grpcio-health",
  "hyper",
  "keys",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "log_wrappers",
  "more-asserts",
  "panic_hook",
@@ -5094,7 +5124,7 @@ dependencies = [
  "byteorder",
  "derive_more",
  "error_code",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "lazy_static",
  "log_wrappers",
  "prometheus",
@@ -5118,7 +5148,7 @@ dependencies = [
  "collections",
  "error_code",
  "hex 0.4.2",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "lazy_static",
  "log_wrappers",
  "match_template",
@@ -5150,7 +5180,7 @@ dependencies = [
  "collections",
  "fail",
  "itertools 0.8.2",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "log_wrappers",
  "match_template",
  "protobuf",
@@ -5245,7 +5275,7 @@ dependencies = [
  "into_other",
  "itertools 0.8.2",
  "keys",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "lazy_static",
  "libc 0.2.86",
  "log",
@@ -5374,7 +5404,7 @@ dependencies = [
  "futures 0.3.7",
  "into_other",
  "keys",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "log_wrappers",
  "panic_hook",
  "prometheus",
@@ -5412,7 +5442,7 @@ dependencies = [
  "futures-util",
  "grpcio",
  "http",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "lazy_static",
  "libc 0.2.86",
  "log",
@@ -5686,7 +5716,7 @@ dependencies = [
  "collections",
  "error_code",
  "farmhash",
- "kvproto",
+ "kvproto 0.0.2 (git+https://github.com/pingcap/kvproto.git)",
  "log_wrappers",
  "slog",
  "thiserror",

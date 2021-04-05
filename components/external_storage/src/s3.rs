@@ -2,9 +2,9 @@
 
 use rusoto_core::request::HttpClient;
 use rusoto_credential::{ProvideAwsCredentials, StaticProvider};
-use std::io;
-use std::marker::PhantomData;
+use std::{io, sync::{Arc, Mutex}};
 
+use futures::TryFutureExt;
 use futures_util::{
     future::FutureExt,
     io::{AsyncRead, AsyncReadExt},
@@ -17,7 +17,7 @@ use rusoto_core::{
 };
 use rusoto_s3::*;
 
-use super::ExternalStorage;
+use super::{AsyncExternalStorage, AsyncResult, AsyncUploader, ExternalStorage};
 use kvproto::backup::S3 as Config;
 use tikv_util::stream::{block_on_external_io, error_stream, retry};
 
@@ -25,10 +25,10 @@ use tikv_util::stream::{block_on_external_io, error_stream, retry};
 #[derive(Clone)]
 pub struct S3Storage {
     config: Config,
-    client: S3Client,
+    client: Arc<S3Client>,
     // This should be safe to remove now that we don't use the global client/dispatcher
     // See https://github.com/tikv/tikv/issues/7236.
-    _not_send: PhantomData<*const ()>,
+    // _not_send: PhantomData<*const ()>,
 }
 
 impl S3Storage {
@@ -55,8 +55,7 @@ impl S3Storage {
         let client = S3Client::new_with(dispatcher, credentials_provider, region);
         Ok(S3Storage {
             config: config.clone(),
-            client,
-            _not_send: PhantomData::default(),
+            client: Arc::new(client)
         })
     }
 
@@ -100,8 +99,8 @@ impl S3Storage {
 /// A helper for uploading a large files to S3 storage.
 ///
 /// Note: this uploader does not support uploading files larger than 19.5 GiB.
-struct S3Uploader<'client> {
-    client: &'client S3Client,
+struct S3Uploader {
+    client: Arc<S3Client>,
 
     bucket: String,
     key: String,
@@ -110,17 +109,17 @@ struct S3Uploader<'client> {
     ssekms_key_id: Option<String>,
     storage_class: Option<String>,
 
-    upload_id: String,
-    parts: Vec<CompletedPart>,
+    upload_id: Mutex<String>,
+    parts: Mutex<Vec<CompletedPart>>,
 }
 
 /// Specifies the minimum size to use multi-part upload.
 /// AWS S3 requires each part to be at least 5 MiB.
 const MINIMUM_PART_SIZE: usize = 5 * 1024 * 1024;
 
-impl<'client> S3Uploader<'client> {
+impl S3Uploader {
     /// Creates a new uploader with a given target location and upload configuration.
-    fn new(client: &'client S3Client, config: &Config, key: String) -> Self {
+    fn new(client: Arc<S3Client>, config: &Config, key: String) -> Self {
         fn get_var(s: &str) -> Option<String> {
             if s.is_empty() {
                 None
@@ -137,15 +136,44 @@ impl<'client> S3Uploader<'client> {
             server_side_encryption: get_var(&config.sse),
             ssekms_key_id: get_var(&config.sse_kms_key_id),
             storage_class: get_var(&config.storage_class),
-            upload_id: "".to_owned(),
-            parts: Vec::new(),
+            upload_id: Mutex::new("".to_owned()),
+            parts: Mutex::new(Vec::new()),
         }
     }
 
+    fn get_upload_id(&self) -> String {
+        self.upload_id.lock().unwrap().clone()
+    }
+
+    fn set_upload_id(&self, upload_id: String) {
+        let mut upload_id_guard = self.upload_id.lock().unwrap();
+        *upload_id_guard = upload_id;
+    }
+
+    fn push_part(&self, part_number: i64, part: CompletedPart) -> Result<(), io::Error> {
+        let mut parts = self.parts.lock().unwrap();
+        if part_number - 1 != parts.len() as i64 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "Expected part number {}, but {}",
+                    parts.len() + 1,
+                    part_number
+                ),
+            ));
+        }
+        parts.push(part);
+        Ok(())
+    }
+
+    fn get_parts(&self) -> Vec<CompletedPart> {
+        self.parts.lock().unwrap().clone()
+    }
+ 
     /// Executes the upload process.
     async fn run(
-        mut self,
-        reader: &mut (dyn AsyncRead + Unpin),
+        self,
+        reader: &mut (dyn AsyncRead + Unpin + Send),
         est_len: u64,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if est_len <= MINIMUM_PART_SIZE as u64 {
@@ -156,17 +184,31 @@ impl<'client> S3Uploader<'client> {
             Ok(())
         } else {
             // Otherwise, use multipart upload to improve robustness.
-            self.upload_id = retry(|| self.begin()).await?;
-            let upload_res = async {
+            let upload_id = retry(|| self.begin()).await?;
+            self.set_upload_id(upload_id);
+            let upload_res: Result<(), Box<dyn std::error::Error + Send>> = async {
                 let mut buf = vec![0; MINIMUM_PART_SIZE];
                 let mut part_number = 1;
                 loop {
-                    let data_size = reader.read(&mut buf).await?;
+                    let read_res = reader.read(&mut buf).await;
+                    if let Err(err) = read_res {
+                        return Err(Box::new(err) as Box<dyn std::error::Error + Send>);
+                    }
+                    let data_size = read_res.unwrap();
                     if data_size == 0 {
                         break;
                     }
-                    let part = retry(|| self.upload_part(part_number, &buf[..data_size])).await?;
-                    self.parts.push(part);
+
+                    let part_res = retry(|| self.upload_part(part_number, &buf[..data_size])).await;
+                    if let Err(err) = part_res {
+                        return Err(Box::new(err));
+                    }
+
+                    let push_part_res = self.push_part(part_number, part_res.unwrap());
+                    if let Err(err) = push_part_res {
+                        return Err(Box::new(err));
+                    }
+
                     part_number += 1;
                 }
                 Ok(())
@@ -175,10 +217,11 @@ impl<'client> S3Uploader<'client> {
 
             if upload_res.is_ok() {
                 retry(|| self.complete()).await?;
+                Ok(())
             } else {
                 let _ = retry(|| self.abort()).await;
+                Err(upload_res.err().unwrap())
             }
-            upload_res
         }
     }
 
@@ -207,9 +250,9 @@ impl<'client> S3Uploader<'client> {
             .complete_multipart_upload(CompleteMultipartUploadRequest {
                 bucket: self.bucket.clone(),
                 key: self.key.clone(),
-                upload_id: self.upload_id.clone(),
+                upload_id: self.get_upload_id(),
                 multipart_upload: Some(CompletedMultipartUpload {
-                    parts: Some(self.parts.clone()),
+                    parts: Some(self.get_parts()),
                 }),
                 ..Default::default()
             })
@@ -223,7 +266,7 @@ impl<'client> S3Uploader<'client> {
             .abort_multipart_upload(AbortMultipartUploadRequest {
                 bucket: self.bucket.clone(),
                 key: self.key.clone(),
-                upload_id: self.upload_id.clone(),
+                upload_id: self.get_upload_id(),
                 ..Default::default()
             })
             .await?;
@@ -243,7 +286,7 @@ impl<'client> S3Uploader<'client> {
             .upload_part(UploadPartRequest {
                 bucket: self.bucket.clone(),
                 key: self.key.clone(),
-                upload_id: self.upload_id.clone(),
+                upload_id: self.get_upload_id(),
                 part_number,
                 content_length: Some(data.len() as i64),
                 body: Some(data.to_vec().into()),
@@ -278,20 +321,104 @@ impl<'client> S3Uploader<'client> {
     }
 }
 
+impl AsyncUploader for S3Uploader {
+    fn begin_async<'a>(&'a self) -> AsyncResult<'a, ()> {
+        Box::pin(async move {
+            let upload_id = self
+                .begin()
+                .map_err(|err| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("failed to begin upload {}", err),
+                    )
+                })
+                .await?;
+            self.set_upload_id(upload_id);
+            Ok(())
+        })
+    }
+
+    fn upload_part_async<'a>(
+        &'a self,
+        part_number: i64,
+        data: &'a [u8],
+    ) -> AsyncResult<'a, ()> {
+        Box::pin(async move {
+            let part = self
+                .upload_part(part_number, data)
+                .map_err(|err| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("failed to begin upload {}", err),
+                    )
+                })
+                .await?;
+
+            self.push_part(part_number, part)?;
+            Ok(())
+        })
+    }
+
+    fn complete_async<'a>(&'a self) -> AsyncResult<'a, ()> {
+        Box::pin(async move {
+            self.complete()
+                .map_err(|err| {
+                    io::Error::new(io::ErrorKind::Other, format!("failed to complete {}", err))
+                })
+                .await?;
+
+            Ok(())
+        })
+    }
+
+    fn abort_async<'a>(&'a self) -> AsyncResult<'a, ()> {
+        Box::pin(async move {
+            self.abort()
+                .map_err(|err| {
+                    io::Error::new(io::ErrorKind::Other, format!("failed to abort {}", err))
+                })
+                .await?;
+
+            Ok(())
+        })
+    }
+}
+
+impl AsyncExternalStorage for S3Storage {
+    fn create_uploader(&self, name: &str) -> Arc<dyn AsyncUploader> {
+        let key = self.maybe_prefix_key(name);
+        Arc::new(S3Uploader::new(self.client.clone(), &self.config, key))
+    }
+
+    fn write_async<'a>(
+        &'a self,
+        name: &'a str,
+        mut reader: Box<dyn AsyncRead + Send + Unpin + 'a>,
+        content_length: u64,
+    ) -> AsyncResult<'a, ()> {
+        let task = async move {
+            let key = self.maybe_prefix_key(name);
+            let uploader = S3Uploader::new(self.client.clone(), &self.config, key.clone());
+            debug!("save file to s3 storage"; "key" => %key);
+            uploader.run(&mut *reader, content_length).await?;
+            Ok(())
+        }
+        .map_err(|e: Box<dyn std::error::Error>| {
+            io::Error::new(io::ErrorKind::Other, format!("failed to put object {}", e))
+        });
+
+        Box::pin(task)
+    }
+}
+
 impl ExternalStorage for S3Storage {
     fn write(
         &self,
         name: &str,
-        mut reader: Box<dyn AsyncRead + Send + Unpin>,
+        reader: Box<dyn AsyncRead + Send + Unpin>,
         content_length: u64,
     ) -> io::Result<()> {
-        let key = self.maybe_prefix_key(name);
-        debug!("save file to s3 storage"; "key" => %key);
-
-        let uploader = S3Uploader::new(&self.client, &self.config, key);
-        block_on_external_io(uploader.run(&mut *reader, content_length)).map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("failed to put object {}", e))
-        })
+        block_on_external_io(self.write_async(name, reader, content_length))
     }
 
     fn read(&self, name: &str) -> Box<dyn AsyncRead + Unpin + '_> {

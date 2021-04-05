@@ -110,8 +110,8 @@ where
     for _ in 1..MAX_RETRY_TIMES {
         if let Err(e) = &final_result {
             if e.is_retryable() {
-                delay_for(retry_wait_dur + Duration::from_millis(thread_rng().gen_range(0, 1000)))
-                    .await;
+                let rand_delay = Duration::from_millis(thread_rng().gen_range(0, 1000));
+                delay_for(retry_wait_dur + rand_delay).await;
                 retry_wait_dur = MAX_RETRY_DELAY.min(retry_wait_dur * 2);
                 final_result = action().await;
                 continue;
@@ -155,5 +155,11 @@ impl<E> RetryError for RusotoError<E> {
 impl RetryError for HttpDispatchError {
     fn is_retryable(&self) -> bool {
         true
+    }
+}
+
+impl RetryError for grpcio::Error {
+    fn is_retryable(&self) -> bool {
+        false
     }
 }
