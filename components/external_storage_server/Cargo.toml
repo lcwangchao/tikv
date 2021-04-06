@@ -19,3 +19,5 @@ kvproto = { path = "../../../kvproto" }
 external_storage = { path = "../external_storage", default-features = false }
 tokio = { version = "0.2", features = ["rt-threaded"]}
 async-trait = "0.1"
+libc = "0.2.9"
+lazy_static = "1.3"

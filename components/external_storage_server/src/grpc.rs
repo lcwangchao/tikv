@@ -1,6 +1,6 @@
-use crate::{ExternalStorageService, ExternalStorageRawClient, ExternalStorageClient};
-use std::sync::Arc;
+use crate::def::*;
 use async_trait::async_trait;
+use std::sync::Arc;
 
 use kvproto::extstorepb::{CallRequest, CallResponse};
 use kvproto::extstorepb_grpc::{ExternalStorage, ExternalStorageClient as PbRpcClient};
@@ -22,7 +22,9 @@ impl<T: ExternalStorageService> RpcExternalStorage<T> {
     }
 }
 
-impl<T: ExternalStorageService + Send + Sync + Clone + 'static> ExternalStorage for RpcExternalStorage<T> {
+impl<T: ExternalStorageService + Send + Sync + Clone + 'static> ExternalStorage
+    for RpcExternalStorage<T>
+{
     fn call(
         &mut self,
         _: grpcio::RpcContext,
@@ -33,33 +35,31 @@ impl<T: ExternalStorageService + Send + Sync + Clone + 'static> ExternalStorage 
         self.runtime.spawn(async move {
             match service.call(req).await {
                 Ok(res) => sink.success(res),
-                Err(err) => sink.fail(err)
+                Err(err) => sink.fail(err),
             }
         });
     }
 }
 
 struct RpcRawClient {
-    client: PbRpcClient
+    client: PbRpcClient,
 }
 
 impl RpcRawClient {
     fn new(channel: ::grpcio::Channel) -> Self {
         Self {
-            client: PbRpcClient::new(channel)
+            client: PbRpcClient::new(channel),
         }
     }
 }
 
 #[async_trait]
 impl ExternalStorageRawClient for RpcRawClient {
-    async fn call(&self, req: &CallRequest) -> crate::RpcErrResult<CallResponse> {
+    async fn call(&self, req: &CallRequest) -> RpcErrResult<CallResponse> {
         Ok(self.client.call_async(req)?.await?)
     }
 }
 
-pub fn new_rpc_client(channel: ::grpcio::Channel) -> ExternalStorageClient {
-    ExternalStorageClient::new(
-        RpcRawClient::new(channel)
-    )
+pub fn new_rpc_client(channel: ::grpcio::Channel) -> ExternalStorageApiClient {
+    ExternalStorageApiClient::new(RpcRawClient::new(channel))
 }

@@ -1401,6 +1401,8 @@ dependencies = [
  "futures-io",
  "grpcio",
  "kvproto 0.0.2",
+ "lazy_static",
+ "libc 0.2.86",
  "protobuf",
  "tokio",
  "uuid",

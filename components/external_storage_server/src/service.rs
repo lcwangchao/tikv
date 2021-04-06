@@ -1,4 +1,4 @@
-use crate::{ExternalStorageService, RpcStatusResult};
+use crate::def::*;
 use async_trait::async_trait;
 use external_storage::{AsyncExternalStorage, AsyncUploader};
 use grpcio::{RpcStatus, RpcStatusCode};
@@ -31,17 +31,13 @@ struct UploaderWrapper {
 pub struct DefaultExternalStorageService {
     storages: Storages,
     uploaders: Uploaders,
-    rt: Arc<::tokio::runtime::Runtime>,
 }
 
 impl DefaultExternalStorageService {
     pub fn new() -> Self {
-        let threaded_rt = ::tokio::runtime::Runtime::new().unwrap();
-
         Self {
             storages: Arc::new(Mutex::new(HashMap::new())),
-            uploaders: Arc::new(Mutex::new(HashMap::new())),
-            rt: Arc::new(threaded_rt),
+            uploaders: Arc::new(Mutex::new(HashMap::new()))
         }
     }
 
