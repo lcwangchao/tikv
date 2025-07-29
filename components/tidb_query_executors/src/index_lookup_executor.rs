@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use itertools::Itertools;
 use kvproto::coprocessor::KeyRange;
 use tidb_query_common::{
-    execute_stats::ExecuteStats,
+    execute_stats::{ExecSummaryCollectorEnabled, ExecuteStats, WithSummaryCollector},
     storage::{IntervalRange, Storage},
     Result,
 };
@@ -37,7 +37,8 @@ use crate::{
 pub struct BatchIndexLookupExecutor<S: Storage, F: KvFormat> {
     schema: Vec<FieldType>,
     cur_probe_index: usize,
-    probe_children: Vec<BatchTableScanExecutor<S, F>>,
+    probe_children:
+        Vec<WithSummaryCollector<ExecSummaryCollectorEnabled, BatchTableScanExecutor<S, F>>>,
 }
 
 // We assign a dummy type `Box<dyn Storage<Statistics = ()>>` so that we can
@@ -57,6 +58,7 @@ impl<S: Storage, F: KvFormat> BatchIndexLookupExecutor<S, F> {
         primary_column_ids: Vec<i64>,
         primary_prefix_column_ids: Vec<i64>,
         probe_ranges: Vec<(S, Vec<KeyRange>)>,
+        table_scan_summary_idx: usize,
     ) -> Result<Self> {
         let mut schema = Vec::with_capacity(columns_info.len());
         for ci in columns_info.iter() {
@@ -67,16 +69,19 @@ impl<S: Storage, F: KvFormat> BatchIndexLookupExecutor<S, F> {
 
         let mut children = Vec::with_capacity(probe_ranges.len());
         for (storage, ranges) in probe_ranges {
-            children.push(BatchTableScanExecutor::new(
-                storage,
-                config.clone(),
-                columns_info.clone(),
-                ranges,
-                primary_column_ids.clone(),
-                false,
-                false,
-                primary_prefix_column_ids.clone(),
-            )?)
+            children.push(
+                BatchTableScanExecutor::new(
+                    storage,
+                    config.clone(),
+                    columns_info.clone(),
+                    ranges,
+                    primary_column_ids.clone(),
+                    false,
+                    false,
+                    primary_prefix_column_ids.clone(),
+                )?
+                .collect_summary(table_scan_summary_idx),
+            )
         }
 
         Ok(BatchIndexLookupExecutor {
@@ -109,7 +114,7 @@ impl<S: Storage, F: KvFormat> BatchExecutor for BatchIndexLookupExecutor<S, F> {
         let mut result = child.next_batch(scan_rows).await;
         match result.is_drained {
             Ok(is_drain) if is_drain.stop() => {
-                child.close_storage_scan();
+                child.inner.close_storage_scan();
                 self.cur_probe_index += 1;
                 if self.cur_probe_index < self.probe_children.len() {
                     result.is_drained = Ok(BatchExecIsDrain::Remain);

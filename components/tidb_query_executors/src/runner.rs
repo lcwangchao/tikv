@@ -65,9 +65,15 @@ impl<SS> ExecutorsWithOutput<SS> {
         is_scanned_range_aware: bool,
         output_offsets: Vec<u32>,
         encode_type: EncodeType,
+        summary_slot_index_start: usize,
     ) -> Result<Self> {
-        let out_most_executor =
-            build_executors::<_, F>(executor_descriptors, ranges, config, is_scanned_range_aware)?;
+        let out_most_executor = build_executors::<_, F>(
+            executor_descriptors,
+            ranges,
+            config,
+            is_scanned_range_aware,
+            summary_slot_index_start,
+        )?;
 
         // Check output offsets
         let schema_len = out_most_executor.schema().len();
@@ -151,6 +157,7 @@ struct ExecutorDescriptors {
     executor_descriptors: Vec<tipb::Executor>,
     output_offsets: Vec<u32>,
     encode_type: EncodeType,
+    summary_slot_index_start: usize,
 }
 
 impl ExecutorDescriptors {
@@ -158,11 +165,13 @@ impl ExecutorDescriptors {
         executor_descriptors: Vec<tipb::Executor>,
         output_offsets: Vec<u32>,
         encode_type: EncodeType,
+        summary_slot_index_start: usize,
     ) -> Self {
         Self {
             executor_descriptors,
             output_offsets,
             encode_type,
+            summary_slot_index_start,
         }
     }
 
@@ -197,6 +206,7 @@ impl ExecutorDescriptors {
                     false,
                     self.output_offsets,
                     self.encode_type,
+                    self.summary_slot_index_start,
                 )
             }
             _ => Err(other_err!(
@@ -243,6 +253,7 @@ impl<SS: 'static> ExecutionGroup<SS> {
                     executor_descriptors: vec![],
                     output_offsets: vec![],
                     encode_type: EncodeType::TypeDefault,
+                    summary_slot_index_start: 0,
                 };
                 mem::swap(desc, &mut descriptors);
                 *self = Self::Instant(
@@ -417,13 +428,14 @@ pub fn build_executors<S: Storage + 'static, F: KvFormat>(
     src_scan_ranges: SrcExecutorRanges<S>,
     config: Arc<EvalConfig>,
     is_scanned_range_aware: bool,
+    summary_slot_index_start: usize,
 ) -> Result<Box<dyn BatchExecutor<StorageStats = S::Statistics>>> {
     let mut executor_descriptors = executor_descriptors.into_iter();
     let first_ed = executor_descriptors
         .next()
         .ok_or_else(|| other_err!("No executors"))?;
 
-    let mut summary_slot_index = 0;
+    let mut summary_slot_index = summary_slot_index_start;
     // Limit executor use this flag to check if its src is table/index scan.
     // Performance enhancement for plan like: limit 1 -> table/index scan.
     let mut is_src_scan_executor = true;
@@ -484,6 +496,7 @@ pub fn build_executors<S: Storage + 'static, F: KvFormat>(
             )
         }
         ExecType::TypeIndexLookup => {
+            summary_slot_index += 1;
             EXECUTOR_COUNT_METRICS.batch_index_lookup.inc();
             let mut descriptor = first_ed.take_index_lookup();
             let probe_side_ranges = src_scan_ranges.into_probe_side_ranges().map_err(|_| {
@@ -492,13 +505,17 @@ pub fn build_executors<S: Storage + 'static, F: KvFormat>(
                     first_ed.get_tp()
                 )
             })?;
-            Box::new(BatchIndexLookupExecutor::<_, F>::new(
-                config.clone(),
-                descriptor.take_columns().into(),
-                descriptor.take_primary_column_ids(),
-                descriptor.take_primary_prefix_column_ids(),
-                probe_side_ranges,
-            )?)
+            Box::new(
+                BatchIndexLookupExecutor::<_, F>::new(
+                    config.clone(),
+                    descriptor.take_columns().into(),
+                    descriptor.take_primary_column_ids(),
+                    descriptor.take_primary_prefix_column_ids(),
+                    probe_side_ranges,
+                    summary_slot_index - 1,
+                )?
+                .collect_summary(summary_slot_index),
+            )
         }
         _ => {
             return Err(other_err!(
@@ -696,13 +713,11 @@ impl<S: Storage<Statistics = SS> + 'static, SS: 'static, F: KvFormat>
         quota_limiter: Arc<QuotaLimiter>,
         locate_key: FnLocateRegionKey<S>,
     ) -> Result<Self> {
-        let executors_len = req.get_executors().len();
         let collect_exec_summary = req.get_collect_execution_summaries();
         let mut config = EvalConfig::from_request(&req)?;
         config.paging_size = paging_size;
         let config = Arc::new(config);
-        let exec_stats = ExecuteStats::new(executors_len);
-        let execution_groups = Self::split_execution_groups(
+        let (execution_groups, summary_count) = Self::split_execution_groups(
             req,
             storage,
             ranges,
@@ -711,6 +726,7 @@ impl<S: Storage<Statistics = SS> + 'static, SS: 'static, F: KvFormat>
                                                     * executors will continue scan from range
                                                     * end where last scan is finished */
         )?;
+        let exec_stats = ExecuteStats::new(summary_count);
 
         Ok(Self {
             deadline,
@@ -732,27 +748,30 @@ impl<S: Storage<Statistics = SS> + 'static, SS: 'static, F: KvFormat>
         first_scan_ranges: Vec<KeyRange>,
         config: Arc<EvalConfig>,
         is_scanned_range_aware: bool,
-    ) -> Result<Vec<ExecutionGroup<SS>>> {
+    ) -> Result<(Vec<ExecutionGroup<SS>>, usize)> {
         let mut executors = req.take_executors().into_vec();
         let mut barriers = req.take_parital_output_barriers();
         if barriers.len() == 0 {
-            return Ok(vec![ExecutionGroup::Instant(ExecutorsWithOutput::build::<
-                _,
-                F,
-            >(
-                &mut executors,
-                Simple((storage, first_scan_ranges)),
-                config,
-                is_scanned_range_aware,
-                req.take_output_offsets().into(),
-                req.get_encode_type(),
-            )?)]);
+            let summary_count = executors.len();
+            return Ok((
+                vec![ExecutionGroup::Instant(ExecutorsWithOutput::build::<_, F>(
+                    &mut executors,
+                    Simple((storage, first_scan_ranges)),
+                    config,
+                    is_scanned_range_aware,
+                    req.take_output_offsets().into(),
+                    req.get_encode_type(),
+                    0,
+                )?)],
+                summary_count,
+            ));
         }
 
         let mut groups = Vec::with_capacity(barriers.len() + 1);
         let mut first_range = Some(Simple((storage, first_scan_ranges)));
         let mut offset = 0usize;
         let executors_len = executors.len();
+        let mut summary_slot_index_start = 0;
         for barrier in barriers.iter_mut() {
             let pos = barrier.get_position() as usize;
             if pos <= offset || pos >= executors_len {
@@ -760,6 +779,7 @@ impl<S: Storage<Statistics = SS> + 'static, SS: 'static, F: KvFormat>
             }
 
             let left_executors = executors.split_off(pos - offset);
+            let summary_slot_index_start_inc = executors.len();
             if offset == 0 {
                 groups.push(ExecutionGroup::Instant(ExecutorsWithOutput::build::<_, F>(
                     &mut executors,
@@ -768,26 +788,32 @@ impl<S: Storage<Statistics = SS> + 'static, SS: 'static, F: KvFormat>
                     is_scanned_range_aware,
                     barrier.take_output_offsets(),
                     barrier.get_encode_type(),
+                    summary_slot_index_start,
                 )?));
+                summary_slot_index_start += summary_slot_index_start_inc;
             } else {
                 groups.push(ExecutionGroup::Descriptors(ExecutorDescriptors::new(
                     executors,
                     barrier.take_output_offsets(),
                     barrier.get_encode_type(),
+                    summary_slot_index_start,
                 )));
+                summary_slot_index_start += summary_slot_index_start_inc + 1;
             }
 
             offset = pos;
             executors = left_executors;
         }
 
+        let summary_count = summary_slot_index_start + executors.len() + 1;
         groups.push(ExecutionGroup::Descriptors(ExecutorDescriptors::new(
             executors,
             req.take_output_offsets(),
             req.get_encode_type(),
+            summary_slot_index_start,
         )));
 
-        Ok(groups)
+        Ok((groups, summary_count))
     }
 
     fn batch_initial_size() -> usize {
