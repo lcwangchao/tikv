@@ -114,6 +114,12 @@
 ## Max running tasks of each worker, reject if exceeded.
 # max-tasks-per-worker = 2000
 
+## Whether to enable flow-aware fair scheduling in the unified read pool.
+# enable-flow-fairness = false
+
+## Max tasks from the same read flow admitted into the unified read pool at once.
+# max-flow-concurrency = 128
+
 [readpool.storage]
 ## Whether to use the unified read pool to handle storage requests.
 # use-unified-pool = true

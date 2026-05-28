@@ -127,7 +127,7 @@ pub use self::{
     },
 };
 use crate::{
-    read_pool::{ReadPool, ReadPoolHandle},
+    read_pool::{ReadFlowId, ReadPool, ReadPoolHandle},
     server::{lock_manager::waiter_manager, metrics::ResourcePriority},
     storage::{
         config::Config,
@@ -658,6 +658,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             process_nanos = tracker.metrics.grpc_process_nanos;
         });
 
+        let flow_id = read_flow_id(&ctx, start_ts);
         let stage_begin_ts = Instant::now();
         self.read_pool_spawn_with_busy_check(
             busy_threshold,
@@ -807,6 +808,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
+            flow_id,
             metadata,
             resource_limiter,
         )
@@ -1042,6 +1044,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
+            None,
             metadata,
             resource_limiter,
         )
@@ -1083,6 +1086,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             tracker.metrics.grpc_process_nanos =
                 tracker.req_info.begin.saturating_elapsed().as_nanos() as u64;
         });
+        let flow_id = read_flow_id(&ctx, start_ts);
         let stage_begin_ts = Instant::now();
         self.read_pool_spawn_with_busy_check(
             busy_threshold,
@@ -1254,6 +1258,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
+            flow_id,
             metadata,
             resource_limiter,
         )
@@ -1296,6 +1301,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             tracker.metrics.grpc_process_nanos =
                 tracker.req_info.begin.saturating_elapsed().as_nanos() as u64;
         });
+        let flow_id = read_flow_id(&ctx, start_ts);
         let stage_begin_ts = Instant::now();
         self.read_pool_spawn_with_busy_check(
             busy_threshold,
@@ -1473,6 +1479,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
+            flow_id,
             metadata,
             resource_limiter,
         )
@@ -1519,6 +1526,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         let concurrency_manager = self.concurrency_manager.clone();
         let api_version = self.api_version;
         let busy_threshold = Duration::from_millis(ctx.busy_threshold_ms as u64);
+        let flow_id = read_flow_id(&ctx, start_ts);
 
         self.read_pool_spawn_with_busy_check(
             busy_threshold,
@@ -1674,6 +1682,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
+            flow_id,
             metadata,
             resource_limiter,
         )
@@ -2107,6 +2116,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
+            None,
             metadata,
             resource_limiter,
         )
@@ -2265,6 +2275,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
+            None,
             metadata,
             resource_limiter,
         )
@@ -2372,6 +2383,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
+            None,
             metadata,
             resource_limiter,
         )
@@ -2906,6 +2918,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
+            None,
             metadata,
             resource_limiter,
         )
@@ -3072,6 +3085,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
+            None,
             metadata,
             resource_limiter,
         )
@@ -3161,6 +3175,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
             .in_resource_metering_tag(resource_tag),
             priority,
             thread_rng().next_u64(),
+            None,
             metadata,
             resource_limiter,
         )
@@ -3367,6 +3382,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         future: Fut,
         priority: CommandPri,
         task_id: u64,
+        flow_id: Option<ReadFlowId>,
         metadata: TaskMetadata<'_>,
         resource_limiter: Option<Arc<ResourceLimiter>>,
     ) -> impl Future<Output = Result<T>>
@@ -3384,7 +3400,14 @@ impl<E: Engine, L: LockManager, F: KvFormat> Storage<E, L, F> {
         let read_pool = self.read_pool.clone();
         FuturesEither::Right(async move {
             read_pool
-                .spawn_handle(future, priority, task_id, metadata, resource_limiter)
+                .spawn_handle_with_flow(
+                    future,
+                    priority,
+                    task_id,
+                    metadata,
+                    resource_limiter,
+                    flow_id,
+                )
                 .map_err(|_| Error::from(ErrorInner::SchedTooBusy))
                 .await?
         })
@@ -3540,6 +3563,10 @@ fn prepare_snap_ctx<'a>(
             .collect();
     }
     Ok(snap_ctx)
+}
+
+fn read_flow_id(ctx: &Context, start_ts: TimeStamp) -> Option<ReadFlowId> {
+    ReadFlowId::new(start_ts.into_inner(), ctx.get_task_id())
 }
 
 pub fn need_check_locks_in_replica_read(ctx: &Context) -> bool {

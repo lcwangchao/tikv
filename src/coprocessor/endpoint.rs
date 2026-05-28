@@ -50,7 +50,7 @@ use crate::{
         cache::CachedRequestHandler, interceptors::*, metrics::*,
         statistics::analyze_context::AnalyzeContext, tracker::Tracker, *,
     },
-    read_pool::ReadPoolHandle,
+    read_pool::{ReadFlowId, ReadPoolHandle},
     server::Config,
     storage::{
         self, Engine, Snapshot, SnapshotStore,
@@ -587,6 +587,10 @@ impl<E: Engine> Endpoint<E> {
         let req_ctx = r.req_ctx;
         let priority = req_ctx.context.get_priority();
         let task_id = req_ctx.build_task_id();
+        let flow_id = ReadFlowId::new(
+            req_ctx.txn_start_ts.into_inner(),
+            req_ctx.context.get_task_id(),
+        );
         let key_ranges: Vec<_> = req_ctx
             .ranges
             .iter()
@@ -627,6 +631,7 @@ impl<E: Engine> Endpoint<E> {
             future,
             priority,
             task_id,
+            flow_id,
             metadata,
             resource_limiter,
         );
@@ -903,6 +908,10 @@ impl<E: Engine> Endpoint<E> {
         let mut allocated_bytes = resource_tag.approximate_heap_size();
 
         let task_id = req_ctx.build_task_id();
+        let flow_id = ReadFlowId::new(
+            req_ctx.txn_start_ts.into_inner(),
+            req_ctx.context.get_task_id(),
+        );
         let tracker = Box::new(Tracker::new(req_ctx, r.req_tag, self.slow_log_threshold));
         allocated_bytes += tracker.approximate_mem_size();
 
@@ -920,6 +929,7 @@ impl<E: Engine> Endpoint<E> {
             future,
             priority,
             task_id,
+            flow_id,
             metadata,
             resource_limiter,
         )?;
@@ -972,6 +982,7 @@ impl<E: Engine> Endpoint<E> {
         future: F,
         priority: CommandPri,
         task_id: u64,
+        flow_id: Option<ReadFlowId>,
         metadata: TaskMetadata<'_>,
         resource_limiter: Option<Arc<ResourceLimiter>>,
     ) -> Result<BoxFuture<'static, Result<()>>>
@@ -987,7 +998,7 @@ impl<E: Engine> Endpoint<E> {
         });
         Ok(self
             .read_pool
-            .spawn(fut, priority, task_id, metadata, resource_limiter)
+            .spawn_with_flow(fut, priority, task_id, metadata, resource_limiter, flow_id)
             .map(|r| r.map_err(|_| Error::MaxPendingTasksExceeded))
             .boxed())
     }

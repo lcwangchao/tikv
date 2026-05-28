@@ -2488,6 +2488,13 @@ pub struct UnifiedReadPoolConfig {
     ///   0.8 means read pool should not use more than 80% of available CPU
     ///   cores.
     pub cpu_threshold: f64,
+    /// Enable flow-aware fair scheduling in the unified read pool.
+    #[online_config(skip)]
+    pub enable_flow_fairness: bool,
+    /// Maximum number of tasks from the same read flow that can be admitted
+    /// into the unified read pool at the same time.
+    #[online_config(skip)]
+    pub max_flow_concurrency: usize,
     // FIXME: Add more configs when they are effective in yatp
 }
 
@@ -2522,6 +2529,12 @@ impl UnifiedReadPoolConfig {
         if self.cpu_threshold < 0.0 || self.cpu_threshold > 1.0 {
             return Err("readpool.unified.cpu-threshold should be between 0.0 and 1.0".into());
         }
+        if self.enable_flow_fairness && self.max_flow_concurrency == 0 {
+            return Err(
+                "readpool.unified.max-flow-concurrency should be > 0 when flow fairness is enabled"
+                    .into(),
+            );
+        }
         Ok(())
     }
 }
@@ -2541,9 +2554,13 @@ impl Default for UnifiedReadPoolConfig {
             max_tasks_per_worker: DEFAULT_READPOOL_MAX_TASKS_PER_WORKER,
             auto_adjust_pool_size: false,
             cpu_threshold: 0.0, // 0 means no threshold (disabled)
+            enable_flow_fairness: false,
+            max_flow_concurrency: DEFAULT_READPOOL_MAX_FLOW_CONCURRENCY,
         }
     }
 }
+
+const DEFAULT_READPOOL_MAX_FLOW_CONCURRENCY: usize = 128;
 
 #[cfg(test)]
 mod unified_read_pool_tests {
@@ -2558,6 +2575,8 @@ mod unified_read_pool_tests {
             max_tasks_per_worker: 2000,
             auto_adjust_pool_size: false,
             cpu_threshold: 0.0,
+            enable_flow_fairness: false,
+            max_flow_concurrency: 0,
         };
         cfg.validate().unwrap();
         let cfg = UnifiedReadPoolConfig {
@@ -2596,6 +2615,12 @@ mod unified_read_pool_tests {
         invalid_cfg.validate().unwrap_err();
         let invalid_cfg = UnifiedReadPoolConfig {
             max_thread_count: SysQuota::cpu_cores_quota() as usize * 10 + 1,
+            ..cfg
+        };
+        invalid_cfg.validate().unwrap_err();
+        let invalid_cfg = UnifiedReadPoolConfig {
+            enable_flow_fairness: true,
+            max_flow_concurrency: 0,
             ..cfg
         };
         invalid_cfg.validate().unwrap_err();
@@ -2895,6 +2920,8 @@ mod readpool_tests {
             max_tasks_per_worker: 0,
             auto_adjust_pool_size: false,
             cpu_threshold: 0.0,
+            enable_flow_fairness: false,
+            max_flow_concurrency: 0,
         };
         unified.validate().unwrap_err();
         let storage = StorageReadPoolConfig {
