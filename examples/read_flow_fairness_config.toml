@@ -7,7 +7,6 @@
 duration = "70s"
 report-path = "read-flow-fairness-sim.html"
 yatp-threads = 2
-max-flow-concurrency = 128
 
 [[payloads]]
 name = "small"
@@ -15,16 +14,17 @@ concurrency = 4
 rate = 20
 query-concurrency = 2
 query-cpu = "20ms"
-query-task-slice-cpu = "1ms"
+query-task-slice-cpu = "2ms"
 slow-query-latency = "60ms"
 
 [[payloads]]
 name = "large"
 concurrency = 2
-rate = 1
-query-concurrency = 4
-query-cpu = "10s"
-query-task-cpu = "50ms"
-query-task-slice-cpu = "1ms"
+rate = 10
+query-concurrency = 32
+query-cpu = "200ms"
+query-task-cpu = "20ms"
+query-task-slice-cpu = "2ms"
 start-time = "10s"
 end-time = "60s"
+#shared-flow-id = true

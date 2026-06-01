@@ -2491,8 +2491,7 @@ pub struct UnifiedReadPoolConfig {
     /// Enable flow-aware fair scheduling in the unified read pool.
     #[online_config(skip)]
     pub enable_flow_fairness: bool,
-    /// Maximum number of tasks from the same read flow that can be admitted
-    /// into the unified read pool at the same time.
+    /// Reserved for flow-aware fair scheduling experiments.
     #[online_config(skip)]
     pub max_flow_concurrency: usize,
     // FIXME: Add more configs when they are effective in yatp
@@ -2528,12 +2527,6 @@ impl UnifiedReadPoolConfig {
         }
         if self.cpu_threshold < 0.0 || self.cpu_threshold > 1.0 {
             return Err("readpool.unified.cpu-threshold should be between 0.0 and 1.0".into());
-        }
-        if self.enable_flow_fairness && self.max_flow_concurrency == 0 {
-            return Err(
-                "readpool.unified.max-flow-concurrency should be > 0 when flow fairness is enabled"
-                    .into(),
-            );
         }
         Ok(())
     }
@@ -2615,12 +2608,6 @@ mod unified_read_pool_tests {
         invalid_cfg.validate().unwrap_err();
         let invalid_cfg = UnifiedReadPoolConfig {
             max_thread_count: SysQuota::cpu_cores_quota() as usize * 10 + 1,
-            ..cfg
-        };
-        invalid_cfg.validate().unwrap_err();
-        let invalid_cfg = UnifiedReadPoolConfig {
-            enable_flow_fairness: true,
-            max_flow_concurrency: 0,
             ..cfg
         };
         invalid_cfg.validate().unwrap_err();

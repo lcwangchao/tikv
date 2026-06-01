@@ -24,7 +24,7 @@ use kvproto::kvrpcpb::CommandPri;
 use serde_derive::{Deserialize, Serialize};
 use tikv::{
     config::UnifiedReadPoolConfig,
-    read_pool::{ReadFlowId, ReadFlowPrioritySnapshot, build_yatp_flow_control_read_pool},
+    read_pool::{ReadFlowKey, ReadFlowPrioritySnapshot, build_yatp_flow_control_read_pool},
 };
 use tikv_util::{
     config::ReadableDuration, resource_control::TaskMetadata, yatp_pool::CleanupMethod,
@@ -64,7 +64,6 @@ impl SimConfig {
             self.simulate.report_path = "read-flow-fairness-sim.html".to_string();
         }
         self.simulate.yatp_threads = self.simulate.yatp_threads.max(1);
-        self.simulate.max_flow_concurrency = self.simulate.max_flow_concurrency.max(1);
         assert!(
             !self.payloads.is_empty(),
             "at least one payload is required"
@@ -107,8 +106,6 @@ struct SimulateConfig {
     report_path: String,
     #[serde(alias = "yatp_threads")]
     yatp_threads: usize,
-    #[serde(alias = "max_flow_concurrency")]
-    max_flow_concurrency: usize,
 }
 
 impl Default for SimulateConfig {
@@ -119,7 +116,6 @@ impl Default for SimulateConfig {
             stats_window: ReadableDuration::secs(5),
             report_path: "read-flow-fairness-sim.html".to_string(),
             yatp_threads: 4,
-            max_flow_concurrency: 128,
         }
     }
 }
@@ -144,6 +140,8 @@ struct PayloadConfig {
     end_time: Interval,
     #[serde(alias = "slow_query_latency")]
     slow_query_latency: Interval,
+    #[serde(alias = "shared_flow_id")]
+    shared_flow_id: bool,
 }
 
 impl Default for PayloadConfig {
@@ -159,11 +157,17 @@ impl Default for PayloadConfig {
             start_time: ReadableDuration::ZERO,
             end_time: ReadableDuration::ZERO,
             slow_query_latency: ReadableDuration::ZERO,
+            shared_flow_id: false,
         }
     }
 }
 
 impl PayloadConfig {
+    fn flow_key(&self, query_seq: u64) -> Option<ReadFlowKey> {
+        let read_ts = if self.shared_flow_id { 1 } else { query_seq };
+        ReadFlowKey::new(read_ts, payload_id(&self.name))
+    }
+
     fn query_task_count(&self) -> usize {
         if self.query_task_cpu.0.is_zero() {
             return 1;
@@ -294,7 +298,7 @@ struct SubTaskResult {
 
 struct SimSubtask {
     handle: tikv::read_pool::ReadPoolHandle,
-    flow_id: Option<ReadFlowId>,
+    flow_key: Option<ReadFlowKey>,
     remaining_cpu: Duration,
     slice_cpu: Duration,
     wait_started_at: Instant,
@@ -311,7 +315,7 @@ struct SimSubtask {
 impl SimSubtask {
     fn new(
         handle: tikv::read_pool::ReadPoolHandle,
-        flow_id: Option<ReadFlowId>,
+        flow_key: Option<ReadFlowKey>,
         created_at: Instant,
         cpu: Duration,
         slice_cpu: Duration,
@@ -330,7 +334,7 @@ impl SimSubtask {
             .unwrap_or(0);
         Self {
             handle,
-            flow_id,
+            flow_key,
             remaining_cpu: cpu,
             slice_cpu,
             wait_started_at: created_at,
@@ -373,7 +377,7 @@ impl Future for SimSubtask {
         }
         self.total_schedule_wait_us = self.total_schedule_wait_us.saturating_add(waited_us);
         if self.collect_timeline {
-            let priority_snapshot = self.handle.read_flow_priority_snapshot(self.flow_id);
+            let priority_snapshot = self.handle.read_flow_priority_snapshot(self.flow_key);
             self.schedule_waits_us.push(waited_us);
             self.priority_snapshots.push(priority_snapshot);
         }
@@ -595,7 +599,7 @@ async fn run_query(
     if stop.load(Ordering::Relaxed) {
         return scratch;
     }
-    let flow_id = ReadFlowId::new(request.query_seq, payload_id(&payload.name));
+    let flow_key = payload.flow_key(request.query_seq);
     let query_start = request.created_at;
     let collect_timeline = !payload.slow_query_latency.0.is_zero();
     let task_count = scratch.task_cpus.len();
@@ -611,7 +615,7 @@ async fn run_query(
         in_flight.push(spawn_subtask(
             payload.name.clone(),
             handle.clone(),
-            flow_id,
+            flow_key,
             next_task_index,
             lane_index,
             query_start,
@@ -654,7 +658,7 @@ async fn run_query(
             in_flight.push(spawn_subtask(
                 payload.name.clone(),
                 handle.clone(),
-                flow_id,
+                flow_key,
                 next_task_index,
                 freed_lane.unwrap_or(next_task_index % max_in_flight.max(1)),
                 query_start,
@@ -700,7 +704,7 @@ async fn run_query(
 async fn spawn_subtask(
     payload: String,
     handle: tikv::read_pool::ReadPoolHandle,
-    flow_id: Option<ReadFlowId>,
+    flow_key: Option<ReadFlowKey>,
     task_index: usize,
     lane_index: usize,
     query_start: Instant,
@@ -714,7 +718,7 @@ async fn spawn_subtask(
     let created_after = created_at.saturating_duration_since(query_start);
     let task = SimSubtask::new(
         handle.clone(),
-        flow_id,
+        flow_key,
         created_at,
         task_cpu,
         slice_cpu,
@@ -739,7 +743,7 @@ async fn spawn_subtask(
             task_index as u64,
             TaskMetadata::default(),
             None,
-            flow_id,
+            flow_key,
             estimated_poll_cpu,
         )
         .await
@@ -775,7 +779,6 @@ async fn run_simulation(cfg: SimConfig) {
         min_thread_count: 1,
         max_thread_count: cfg.simulate.yatp_threads,
         enable_flow_fairness: true,
-        max_flow_concurrency: cfg.simulate.max_flow_concurrency,
         ..Default::default()
     };
     let read_pool = build_yatp_flow_control_read_pool(
@@ -1381,7 +1384,7 @@ mod stats {
     }
 
     fn report_style() -> &'static str {
-        r#"body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:32px;color:#1f2933}h1{margin-bottom:24px}section{margin:0 0 36px}h2{font-size:18px;margin:0 0 10px}pre{padding:12px;border:1px solid #d8dee4;background:#f6f8fa;overflow:auto}details{margin-top:10px}summary{cursor:pointer}.chart-wrap{height:320px;border:1px solid #d8dee4;padding:16px;background:#fff}.metric-table{margin-top:10px}.table-wrap{overflow:auto;border:1px solid #d8dee4;background:#fff}table{border-collapse:collapse;width:100%;font-size:13px}th,td{border:1px solid #d8dee4;padding:6px 8px;text-align:left;white-space:nowrap}th{background:#f6f8fa}.kv{display:inline-flex;align-items:baseline;margin:2px 6px 2px 0;border:1px solid #d8dee4;background:#f8fafc;border-radius:4px;overflow:hidden;font-size:12px;line-height:1.5}.kv-key{padding:1px 5px;color:#475569;background:#eef2f7;font-weight:600}.kv-value{padding:1px 6px;color:#0f172a;font-weight:500}.slow-query{border:1px solid #d8dee4;margin:0 0 16px;padding:12px;background:#fff}.slow-query summary{font-weight:600}.slow-detail{margin-top:12px}.slow-legend{margin:0 0 10px}.slow-viz{overflow:auto;padding:8px 0}.slow-overview{min-width:760px;border:1px solid #d8dee4;background:#fff}.time-axis-h{position:relative;margin-left:72px;height:28px;border-bottom:1px solid #cbd5e1}.time-tick-h{position:absolute;top:0;bottom:0;border-left:1px solid #cbd5e1;color:#64748b;font-size:11px}.time-tick-h span{position:relative;left:4px;top:2px;background:#fff;padding:0 2px}.lane-section{border-top:1px solid #e2e8f0}.lane-main{position:relative;height:42px}.lane-label{position:absolute;left:0;top:0;width:64px;height:100%;display:flex;align-items:center;justify-content:flex-end;padding-right:8px;color:#475569;font-size:12px}.lane-track{position:absolute;left:72px;right:0;top:7px;height:28px;background:#f8fafc;border-left:1px solid #cbd5e1}.lane-task-details{position:relative;margin-left:72px;margin-right:10px;margin-bottom:10px;padding-top:8px}.task-block{position:absolute;top:2px;height:24px;min-width:8px;border:2px solid #334155;background:#dbeafe;box-sizing:border-box;overflow:hidden;cursor:pointer}.task-block:hover:not(.is-selected){outline:2px dashed #64748b;z-index:3}.task-block.is-selected{border-color:#2563eb;box-shadow:0 0 0 4px rgba(37,99,235,.48);z-index:4}.task-overview-segment{position:absolute;top:0;bottom:0}.task-label{position:relative;z-index:1;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;font-weight:600;line-height:20px;padding:0 4px;color:#064e3b;text-shadow:0 1px 1px rgba(255,255,255,.8)}.task-detail{position:relative;display:none;border:1px solid #d8dee4;background:#f8fafc;padding:10px}.task-detail.is-active{display:block;border-color:#93c5fd;background:#eff6ff;box-shadow:0 2px 8px rgba(15,23,42,.08)}.detail-title{margin-bottom:8px}.detail-timeline{position:relative;height:32px;border:1px solid #cbd5e1;background:#fff}.slice-block{position:absolute;top:4px;height:22px;min-width:6px;border:1px solid #334155;background:#fff;box-sizing:border-box;cursor:pointer;overflow:hidden}.slice-block:hover:not(.is-selected){outline:2px dashed #64748b;z-index:2}.slice-block.is-selected{border-color:#2563eb;box-shadow:0 0 0 4px rgba(37,99,235,.48);z-index:3}.slice-segment{position:absolute;top:0;bottom:0}.slice-details{position:relative;margin-top:8px;padding-top:8px}.slice-detail{position:relative;display:none;border:1px solid #d8dee4;background:#fff;padding:8px}.slice-detail.is-active{display:block;border-color:#93c5fd;background:#eff6ff;box-shadow:0 2px 8px rgba(15,23,42,.08)}.slice-detail-title{margin-bottom:6px}.slice-timeline{position:relative;height:22px;border:1px solid #cbd5e1;background:#fff}.slice-detail-segment{position:absolute;top:0;bottom:0}.state-wait{background:#f97316}.state-cpu{background:#86efac}.state-other{background:#94a3b8}.legend-chip{display:inline-block;width:10px;height:10px;margin-right:4px;vertical-align:-1px}.muted{color:#64748b}"#
+        r#"body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:32px;color:#1f2933}h1{margin-bottom:24px}section{margin:0 0 36px}h2{font-size:18px;margin:0 0 10px}pre{padding:12px;border:1px solid #d8dee4;background:#f6f8fa;overflow:auto}details{margin-top:10px}summary{cursor:pointer}.chart-wrap{height:320px;border:1px solid #d8dee4;padding:16px;background:#fff}.metric-table{margin-top:10px}.table-wrap{overflow:auto;border:1px solid #d8dee4;background:#fff}table{border-collapse:collapse;width:100%;font-size:13px}th,td{border:1px solid #d8dee4;padding:6px 8px;text-align:left;white-space:nowrap}th{background:#f6f8fa}.kv{display:inline-flex;align-items:baseline;margin:2px 6px 2px 0;border:1px solid #d8dee4;background:#f8fafc;border-radius:4px;overflow:hidden;font-size:12px;line-height:1.5}.kv-key{padding:1px 5px;color:#475569;background:#eef2f7;font-weight:600}.kv-value{padding:1px 6px;color:#0f172a;font-weight:500}.slow-query{border:1px solid #d8dee4;margin:0 0 16px;padding:12px;background:#fff}.slow-query summary{font-weight:600}.slow-detail{margin-top:12px}.slow-legend{margin:0 0 10px}.slow-viz{overflow:auto;padding:8px 0}.slow-overview{min-width:760px;border:1px solid #d8dee4;background:#fff}.time-axis-h{position:relative;margin-left:72px;height:28px;border-bottom:1px solid #cbd5e1}.time-tick-h{position:absolute;top:0;bottom:0;border-left:1px solid #cbd5e1;color:#64748b;font-size:11px}.time-tick-h span{position:relative;left:4px;top:2px;background:#fff;padding:0 2px}.lane-section{border-top:1px solid #e2e8f0}.lane-main{position:relative;height:42px}.lane-label{position:absolute;left:0;top:0;width:64px;height:100%;display:flex;align-items:center;justify-content:flex-end;padding-right:8px;color:#475569;font-size:12px}.lane-track{position:absolute;left:72px;right:0;top:7px;height:28px;background:#f8fafc;border-left:1px solid #cbd5e1}.lane-task-details{position:relative;margin-left:72px;margin-right:10px;margin-bottom:10px;padding-top:8px}.task-block{position:absolute;top:2px;height:24px;min-width:8px;border:2px solid #334155;background:#dbeafe;box-sizing:border-box;overflow:hidden;cursor:pointer}.task-block:hover:not(.is-selected){outline:2px dashed #64748b;z-index:3}.task-block.is-selected{border-color:#2563eb;box-shadow:0 0 0 4px rgba(37,99,235,.48);z-index:4}.task-overview-segment{position:absolute;top:0;bottom:0}.task-label{position:relative;z-index:1;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;font-weight:600;line-height:20px;padding:0 4px;color:#064e3b;text-shadow:0 1px 1px rgba(255,255,255,.8)}.task-detail{position:relative;display:none;border:1px solid #d8dee4;background:#f8fafc;padding:10px}.task-detail.is-active{display:block;border-color:#93c5fd;background:#eff6ff;box-shadow:0 2px 8px rgba(15,23,42,.08)}.detail-title{margin-bottom:8px}.detail-timeline{position:relative;height:32px;border:1px solid #cbd5e1;background:#fff}.slice-block{position:absolute;top:4px;height:22px;min-width:6px;border:1px solid #334155;background:#fff;box-sizing:border-box;cursor:pointer;overflow:hidden}.slice-block:hover:not(.is-selected){outline:2px dashed #64748b;z-index:2}.slice-block.is-selected{border-color:#2563eb;box-shadow:0 0 0 4px rgba(37,99,235,.48);z-index:3}.slice-segment{position:absolute;top:0;bottom:0}.slice-details{position:relative;margin-top:8px;padding-top:8px}.slice-detail{position:relative;display:none;border:1px solid #d8dee4;background:#fff;padding:8px}.slice-detail.is-active{display:block;border-color:#93c5fd;background:#eff6ff;box-shadow:0 2px 8px rgba(15,23,42,.08)}.slice-detail-title{margin-bottom:6px}.slice-timeline{position:relative;height:22px;border:1px solid #cbd5e1;background:#fff}.slice-detail-segment{position:absolute;top:0;bottom:0}.state-wait{background:#f97316}.state-wait-normal{background:#f59e0b}.state-wait-throttled{background:#a855f7}.state-cpu{background:#86efac}.state-other{background:#94a3b8}.legend-chip{display:inline-block;width:10px;height:10px;margin-right:4px;vertical-align:-1px}.muted{color:#64748b}"#
     }
 
     fn resolve_report_path(report_path: &str) -> PathBuf {
@@ -1502,7 +1505,7 @@ mod stats {
             .map(render_slow_query)
             .collect::<String>();
         format!(
-            "<section><h2>Slow Queries</h2><p class=\"muted\"><span class=\"legend-chip state-wait\"></span>schedule wait <span class=\"legend-chip state-cpu\"></span>CPU <span class=\"legend-chip state-other\"></span>other</p>{}</section>",
+            "<section><h2>Slow Queries</h2><p class=\"muted\"><span class=\"legend-chip state-wait-normal\"></span>normal wait <span class=\"legend-chip state-wait-throttled\"></span>throttled wait <span class=\"legend-chip state-cpu\"></span>CPU <span class=\"legend-chip state-other\"></span>other</p>{}</section>",
             body
         )
     }
@@ -1610,8 +1613,9 @@ mod stats {
         let segment_count = task.schedule_waits_us.len().max(task.cpu_slices_us.len());
         for index in 0..segment_count {
             if let Some(wait_us) = task.schedule_waits_us.get(index).copied() {
+                let priority_snapshot = task.priority_snapshots.get(index).copied().flatten();
                 segments.push_str(&render_task_overview_segment(
-                    "state-wait",
+                    wait_class(priority_snapshot),
                     offset_us,
                     wait_us,
                     task.elapsed_us,
@@ -1713,6 +1717,7 @@ mod stats {
         let wait_width = wait_us as f64 / duration_us as f64 * 100.0;
         let cpu_width = cpu_us as f64 / duration_us as f64 * 100.0;
         let priority_snapshot = task.priority_snapshots.get(slice_index).copied().flatten();
+        let wait_class = wait_class(priority_snapshot);
         let title = slice_title(
             task,
             slice_index,
@@ -1722,12 +1727,13 @@ mod stats {
             priority_snapshot,
         );
         format!(
-            "<div class=\"slice-block\" data-task-id=\"{}\" data-slice-id=\"{}\" style=\"left:{:.4}%;width:{:.4}%\" title=\"{}\"><span class=\"slice-segment state-wait\" style=\"left:0;width:{:.4}%\"></span><span class=\"slice-segment state-cpu\" style=\"left:{:.4}%;width:{:.4}%\"></span></div>",
+            "<div class=\"slice-block\" data-task-id=\"{}\" data-slice-id=\"{}\" style=\"left:{:.4}%;width:{:.4}%\" title=\"{}\"><span class=\"slice-segment {}\" style=\"left:0;width:{:.4}%\"></span><span class=\"slice-segment state-cpu\" style=\"left:{:.4}%;width:{:.4}%\"></span></div>",
             task_dom_id(task),
             slice_dom_id(task, slice_index),
             left,
             width.min(100.0 - left.min(100.0)),
             escape_html(&title),
+            wait_class,
             wait_width,
             wait_width,
             cpu_width
@@ -1769,21 +1775,32 @@ mod stats {
                     duration_us,
                     task.priority_snapshots.get(index).copied().flatten(),
                 ),
-                render_slice_detail_segments(wait_us, cpu_us, duration_us)
+                render_slice_detail_segments(
+                    wait_us,
+                    cpu_us,
+                    duration_us,
+                    task.priority_snapshots.get(index).copied().flatten(),
+                )
             ));
         }
         panels
     }
 
-    fn render_slice_detail_segments(wait_us: u64, cpu_us: u64, total_us: u64) -> String {
+    fn render_slice_detail_segments(
+        wait_us: u64,
+        cpu_us: u64,
+        total_us: u64,
+        priority_snapshot: Option<ReadFlowPrioritySnapshot>,
+    ) -> String {
         let mut segments = String::new();
         if wait_us > 0 {
+            let slot = slot_label(priority_snapshot);
             segments.push_str(&render_slice_detail_segment(
-                "state-wait",
+                wait_class(priority_snapshot),
                 0,
                 wait_us,
                 total_us,
-                &format!("schedule wait {}", fmt_ms(wait_us)),
+                &format!("{slot} schedule wait {}", fmt_ms(wait_us)),
             ));
         }
         if cpu_us > 0 {
@@ -1873,6 +1890,15 @@ mod stats {
         ];
         if let Some(snapshot) = priority_snapshot {
             pairs.extend([
+                (
+                    "slot",
+                    if snapshot.throttled {
+                        "throttled"
+                    } else {
+                        "normal"
+                    }
+                    .to_string(),
+                ),
                 ("vt", fmt_us(snapshot.virtual_time_us)),
                 ("min_vt", fmt_us(snapshot.min_virtual_time_us)),
                 ("priority", snapshot.priority.to_string()),
@@ -1892,7 +1918,12 @@ mod stats {
         let priority = priority_snapshot
             .map(|snapshot| {
                 format!(
-                    "\nvt {}\nmin_vt {}\npriority {}",
+                    "\nslot {}\nvt {}\nmin_vt {}\npriority {}",
+                    if snapshot.throttled {
+                        "throttled"
+                    } else {
+                        "normal"
+                    },
                     fmt_us(snapshot.virtual_time_us),
                     fmt_us(snapshot.min_virtual_time_us),
                     snapshot.priority
@@ -1908,6 +1939,22 @@ mod stats {
             fmt_ms(cpu_us),
             priority
         )
+    }
+
+    fn wait_class(priority_snapshot: Option<ReadFlowPrioritySnapshot>) -> &'static str {
+        match priority_snapshot {
+            Some(snapshot) if snapshot.throttled => "state-wait-throttled",
+            Some(_) => "state-wait-normal",
+            None => "state-wait",
+        }
+    }
+
+    fn slot_label(priority_snapshot: Option<ReadFlowPrioritySnapshot>) -> &'static str {
+        match priority_snapshot {
+            Some(snapshot) if snapshot.throttled => "throttled",
+            Some(_) => "normal",
+            None => "unknown",
+        }
     }
 
     fn task_title(task: &SlowQueryTaskSample) -> String {
@@ -2275,10 +2322,9 @@ function createLineChart(id, title, yLabel, unit, datasets) {{
 fn main() {
     let cfg = load_config();
     println!(
-        "start read flow fairness sim: duration={:?}, yatp_threads={}, max_flow_concurrency={}, payloads={}",
+        "start read flow fairness sim: duration={:?}, yatp_threads={}, payloads={}",
         cfg.simulate.duration.0,
         cfg.simulate.yatp_threads,
-        cfg.simulate.max_flow_concurrency,
         cfg.payloads.len()
     );
     let runtime = Builder::new_current_thread().enable_time().build().unwrap();

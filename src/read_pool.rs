@@ -1,13 +1,14 @@
 // Copyright 2020 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::{
-    collections::HashMap,
+    cell::Cell,
+    collections::HashSet,
     convert::TryFrom,
     future::Future,
     pin::Pin,
     sync::{
-        Arc, Mutex, RwLock,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering},
         mpsc::SyncSender,
     },
     task::{Context, Poll},
@@ -15,6 +16,7 @@ use std::{
 };
 
 use cpu_time::ThreadTime;
+use dashmap::DashMap;
 use file_system::{IoType, set_io_type};
 use futures::{
     channel::oneshot,
@@ -38,7 +40,6 @@ use tikv_util::{
     worker::{Runnable, RunnableWithTimer, Scheduler, Worker},
     yatp_pool::{self, CleanupMethod, DefaultTicker, FuturePool, PoolTicker, YatpPoolBuilder},
 };
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracker::TlsTrackedFuture;
 use yatp::{
     metrics::MULTILEVEL_LEVEL_ELAPSED,
@@ -63,14 +64,46 @@ const READ_POOL_THREAD_HIGH_THRESHOLD: f64 = 0.8;
 const READ_POOL_THREAD_LOW_THRESHOLD: f64 = 0.7;
 // avg running tasks per-thread that indicates read-pool is busy
 const RUNNING_TASKS_PER_THREAD_THRESHOLD: i64 = 3;
-// Cap flow virtual-time lag so old CPU usage does not suppress a flow forever.
 const MAX_READ_FLOW_VIRTUAL_TIME_LAG_US: u64 = 1_000_000;
-const READ_FLOW_SCAN_INTERVAL: Duration = Duration::from_millis(200);
-const READ_FLOW_MAP_SHARDS: usize = 1024;
-const READ_FLOW_MAP_SHARD_MASK: u64 = READ_FLOW_MAP_SHARDS as u64 - 1;
+const READ_FLOW_GC_CHECK_INTERVAL: Duration = Duration::from_millis(200);
+const READ_FLOW_WINDOW_SLICE_US: u64 = 100_000;
+const READ_FLOW_FINISHED_WINDOW_SLICES: usize = 4;
+const READ_FLOW_CPU_WINDOW_US: u64 =
+    READ_FLOW_WINDOW_SLICE_US * (READ_FLOW_FINISHED_WINDOW_SLICES as u64 + 1);
+const READ_FLOW_RECENT_CPU_WINDOW_US: u64 = 100_000;
+const READ_FLOW_CPU_WINDOW_BUCKETS: usize = 100;
+const READ_FLOW_NORMAL_SLOT_WEIGHT: u64 = 80;
+const READ_FLOW_THROTTLED_SLOT_WEIGHT: u64 = 20;
+const READ_FLOW_POOL_BUSY_PERCENT: u64 = 90;
+const READ_FLOW_NORMAL_SLOT_SHARE_PERCENT: u64 = 80;
+const READ_FLOW_HIGH_CPU_ENTER_PERCENT: u64 = 5;
+const READ_FLOW_HIGH_CPU_EXIT_PERCENT: u64 = 4;
+const READ_FLOW_THROTTLED_RETURN_PERCENT: u64 = 2;
+const READ_FLOW_RECENT_THROTTLE_PERCENT: u64 = 20;
+const READ_FLOW_SLOT_MIGRATION_CHECK_INTERVAL_US: u64 = 10_000;
+const READ_FLOW_REFS_INITIALIZING: i64 = -1;
+const READ_FLOW_REFS_DELETING: i64 = -2;
+
+thread_local! {
+    static READ_FLOW_CONTROL_CPU_TIME: Cell<Duration> = Cell::new(Duration::ZERO);
+}
+
+fn reset_read_flow_control_cpu_time() {
+    READ_FLOW_CONTROL_CPU_TIME.with(|cpu_time| cpu_time.set(Duration::ZERO));
+}
+
+fn add_read_flow_control_cpu_time(duration: Duration) {
+    READ_FLOW_CONTROL_CPU_TIME.with(|cpu_time| {
+        cpu_time.set(cpu_time.get().saturating_add(duration));
+    });
+}
+
+fn take_read_flow_control_cpu_time() -> Duration {
+    READ_FLOW_CONTROL_CPU_TIME.with(|cpu_time| cpu_time.replace(Duration::ZERO))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub struct ReadFlowId {
+pub struct ReadFlowKey {
     pub read_ts: u64,
     pub task_id: u64,
 }
@@ -80,9 +113,10 @@ pub struct ReadFlowPrioritySnapshot {
     pub virtual_time_us: u64,
     pub min_virtual_time_us: u64,
     pub priority: u64,
+    pub throttled: bool,
 }
 
-impl ReadFlowId {
+impl ReadFlowKey {
     pub fn new(read_ts: u64, task_id: u64) -> Option<Self> {
         if read_ts == 0 && task_id == 0 {
             None
@@ -90,221 +124,472 @@ impl ReadFlowId {
             Some(Self { read_ts, task_id })
         }
     }
+}
 
-    fn hash(&self) -> u64 {
-        let mut x = self.read_ts ^ self.task_id.rotate_left(32);
-        x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        x ^ (x >> 31)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReadFlowSlot {
+    Normal,
+    Throttled,
+}
+
+impl ReadFlowSlot {
+    fn weight(self) -> u64 {
+        match self {
+            ReadFlowSlot::Normal => READ_FLOW_NORMAL_SLOT_WEIGHT,
+            ReadFlowSlot::Throttled => READ_FLOW_THROTTLED_SLOT_WEIGHT,
+        }
     }
 
-    fn shard_id(&self) -> usize {
-        (self.hash() & READ_FLOW_MAP_SHARD_MASK) as usize
+    fn is_throttled(self) -> bool {
+        self == ReadFlowSlot::Throttled
+    }
+
+    fn from_throttled(is_throttled: bool) -> Self {
+        if is_throttled {
+            ReadFlowSlot::Throttled
+        } else {
+            ReadFlowSlot::Normal
+        }
+    }
+}
+
+struct ReadFlowCpuWindowInner {
+    last_bucket: Option<u64>,
+    buckets: [u64; READ_FLOW_CPU_WINDOW_BUCKETS],
+    total_us: u64,
+}
+
+struct ReadFlowCpuWindow {
+    bucket_us: u64,
+    inner: Mutex<ReadFlowCpuWindowInner>,
+}
+
+impl ReadFlowCpuWindow {
+    fn new(window_us: u64) -> Self {
+        Self {
+            bucket_us: (window_us / READ_FLOW_CPU_WINDOW_BUCKETS as u64).max(1),
+            inner: Mutex::new(ReadFlowCpuWindowInner {
+                last_bucket: None,
+                buckets: [0; READ_FLOW_CPU_WINDOW_BUCKETS],
+                total_us: 0,
+            }),
+        }
+    }
+
+    fn add(&self, now_us: u64, cpu_us: u64) {
+        if cpu_us == 0 {
+            return;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        self.advance_locked(&mut inner, now_us);
+        let bucket = now_us / self.bucket_us;
+        let idx = bucket as usize % READ_FLOW_CPU_WINDOW_BUCKETS;
+        inner.buckets[idx] = inner.buckets[idx].saturating_add(cpu_us);
+        inner.total_us = inner.total_us.saturating_add(cpu_us);
+    }
+
+    fn total(&self, now_us: u64) -> u64 {
+        let mut inner = self.inner.lock().unwrap();
+        self.advance_locked(&mut inner, now_us);
+        inner.total_us
+    }
+
+    fn advance_locked(&self, inner: &mut ReadFlowCpuWindowInner, now_us: u64) {
+        let bucket = now_us / self.bucket_us;
+        let Some(last_bucket) = inner.last_bucket else {
+            inner.last_bucket = Some(bucket);
+            return;
+        };
+        if bucket <= last_bucket {
+            return;
+        }
+
+        let delta = bucket.saturating_sub(last_bucket);
+        if delta >= READ_FLOW_CPU_WINDOW_BUCKETS as u64 {
+            inner.buckets.fill(0);
+            inner.total_us = 0;
+        } else {
+            for bucket_to_clear in last_bucket + 1..=bucket {
+                let idx = bucket_to_clear as usize % READ_FLOW_CPU_WINDOW_BUCKETS;
+                inner.total_us = inner.total_us.saturating_sub(inner.buckets[idx]);
+                inner.buckets[idx] = 0;
+            }
+        }
+        inner.last_bucket = Some(bucket);
+    }
+}
+
+struct ReadFlowSlotState {
+    virtual_time_us: AtomicU64,
+    cpu_window: ReadFlowCpuWindow,
+}
+
+impl ReadFlowSlotState {
+    fn new() -> Self {
+        Self {
+            virtual_time_us: AtomicU64::new(0),
+            cpu_window: ReadFlowCpuWindow::new(READ_FLOW_CPU_WINDOW_US),
+        }
+    }
+
+    fn charge(&self, cpu_us: u64, weight: u64) -> u64 {
+        if cpu_us == 0 {
+            return self.virtual_time_us.load(Ordering::Acquire);
+        }
+        let virtual_delta = cpu_us.saturating_mul(100).saturating_div(weight.max(1));
+        self.virtual_time_us
+            .fetch_add(virtual_delta, Ordering::AcqRel)
+            .saturating_add(virtual_delta)
+    }
+}
+
+struct ReadFlowSlots {
+    normal: ReadFlowSlotState,
+    throttled: ReadFlowSlotState,
+}
+
+impl ReadFlowSlots {
+    fn new() -> Self {
+        Self {
+            normal: ReadFlowSlotState::new(),
+            throttled: ReadFlowSlotState::new(),
+        }
+    }
+
+    fn get(&self, slot: ReadFlowSlot) -> &ReadFlowSlotState {
+        match slot {
+            ReadFlowSlot::Normal => &self.normal,
+            ReadFlowSlot::Throttled => &self.throttled,
+        }
+    }
+
+    fn min_virtual_time_us(&self) -> u64 {
+        self.normal
+            .virtual_time_us
+            .load(Ordering::Acquire)
+            .min(self.throttled.virtual_time_us.load(Ordering::Acquire))
     }
 }
 
 struct ReadFlowState {
-    semaphore: Arc<Semaphore>,
-    refs: AtomicUsize,
-    virtual_time_us: AtomicU64,
+    id: u64,
+    key: ReadFlowKey,
+    created_at_us: u64,
+    refs: AtomicI64,
     idle_since_us: AtomicU64,
+    window_slice_index: AtomicU64,
+    current_slice_cpu_us: AtomicU64,
+    window_cpu_us: AtomicU32,
+    finished_slice_cpu_ms: Mutex<[u16; READ_FLOW_FINISHED_WINDOW_SLICES]>,
+    throttled: AtomicBool,
+    throttled_since_us: AtomicU64,
 }
 
-struct ReadFlowTaskState {
-    flow: Arc<ReadFlowState>,
-    priority_us: AtomicU64,
-}
-
-struct FlowMapShard {
-    flows: HashMap<ReadFlowId, Arc<ReadFlowState>>,
-    flow_task_ids: HashMap<u64, Arc<ReadFlowTaskState>>,
-}
-
-impl FlowMapShard {
-    fn new() -> Self {
+impl ReadFlowState {
+    fn new_initializing(id: u64, key: ReadFlowKey, created_at_us: u64) -> Self {
         Self {
-            flows: HashMap::new(),
-            flow_task_ids: HashMap::new(),
+            id,
+            key,
+            created_at_us,
+            refs: AtomicI64::new(READ_FLOW_REFS_INITIALIZING),
+            idle_since_us: AtomicU64::new(0),
+            window_slice_index: AtomicU64::new(Self::slice_index(created_at_us)),
+            current_slice_cpu_us: AtomicU64::new(0),
+            window_cpu_us: AtomicU32::new(0),
+            finished_slice_cpu_ms: Mutex::new([0; READ_FLOW_FINISHED_WINDOW_SLICES]),
+            throttled: AtomicBool::new(false),
+            throttled_since_us: AtomicU64::new(0),
         }
+    }
+
+    fn slice_index(now_us: u64) -> u64 {
+        now_us / READ_FLOW_WINDOW_SLICE_US
+    }
+
+    fn advance_window(&self, now_us: u64) {
+        let new_slice_index = Self::slice_index(now_us);
+        if new_slice_index <= self.window_slice_index.load(Ordering::Acquire) {
+            return;
+        }
+
+        let mut finished_slice_cpu_ms = self.finished_slice_cpu_ms.lock().unwrap();
+        self.advance_window_locked(&mut finished_slice_cpu_ms, new_slice_index);
+    }
+
+    fn advance_window_locked(
+        &self,
+        finished_slice_cpu_ms: &mut [u16; READ_FLOW_FINISHED_WINDOW_SLICES],
+        new_slice_index: u64,
+    ) {
+        let old_slice_index = self.window_slice_index.load(Ordering::Acquire);
+        if new_slice_index <= old_slice_index {
+            return;
+        }
+
+        let old_current_slice_cpu_us = self.current_slice_cpu_us.swap(0, Ordering::AcqRel);
+        let mut window_cpu_us = self.window_cpu_us.load(Ordering::Acquire);
+        let elapsed_slices = new_slice_index.saturating_sub(old_slice_index);
+
+        if elapsed_slices > READ_FLOW_FINISHED_WINDOW_SLICES as u64 {
+            finished_slice_cpu_ms.fill(0);
+            window_cpu_us = 0;
+        } else {
+            window_cpu_us =
+                window_cpu_us.saturating_sub(Self::u64_to_u32_saturating(old_current_slice_cpu_us));
+            let old_current_slice_cpu_ms =
+                (old_current_slice_cpu_us / 1_000).min(u64::from(u16::MAX)) as u16;
+            let old_current_slot = old_slice_index as usize % READ_FLOW_FINISHED_WINDOW_SLICES;
+            window_cpu_us = window_cpu_us.saturating_sub(
+                u32::from(finished_slice_cpu_ms[old_current_slot]).saturating_mul(1_000),
+            );
+            finished_slice_cpu_ms[old_current_slot] = old_current_slice_cpu_ms;
+            window_cpu_us = window_cpu_us
+                .saturating_add(u32::from(old_current_slice_cpu_ms).saturating_mul(1_000));
+
+            for skipped_slice_index in old_slice_index + 1..new_slice_index {
+                let skipped_slot = skipped_slice_index as usize % READ_FLOW_FINISHED_WINDOW_SLICES;
+                window_cpu_us = window_cpu_us.saturating_sub(
+                    u32::from(finished_slice_cpu_ms[skipped_slot]).saturating_mul(1_000),
+                );
+                finished_slice_cpu_ms[skipped_slot] = 0;
+            }
+        }
+
+        self.window_cpu_us.store(window_cpu_us, Ordering::Release);
+        self.window_slice_index
+            .store(new_slice_index, Ordering::Release);
+    }
+
+    fn add_cpu(&self, now_us: u64, cpu_us: u64) {
+        let new_slice_index = Self::slice_index(now_us);
+        let mut finished_slice_cpu_ms = self.finished_slice_cpu_ms.lock().unwrap();
+        self.advance_window_locked(&mut finished_slice_cpu_ms, new_slice_index);
+        self.current_slice_cpu_us
+            .fetch_add(cpu_us, Ordering::AcqRel);
+        let cpu_us = Self::u64_to_u32_saturating(cpu_us);
+        let _ =
+            self.window_cpu_us
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |window_cpu_us| {
+                    Some(window_cpu_us.saturating_add(cpu_us))
+                });
+    }
+
+    fn window_cpu_us(&self, now_us: u64) -> u64 {
+        self.advance_window(now_us);
+        u64::from(self.window_cpu_us.load(Ordering::Acquire))
+    }
+
+    fn recent_cpu_us(&self, now_us: u64) -> u64 {
+        self.advance_window(now_us);
+        self.current_slice_cpu_us.load(Ordering::Acquire)
+    }
+
+    fn u64_to_u32_saturating(value: u64) -> u32 {
+        value.min(u64::from(u32::MAX)) as u32
     }
 }
 
 struct FlowsMap {
-    shards: Vec<RwLock<FlowMapShard>>,
+    by_key: DashMap<ReadFlowKey, Arc<ReadFlowState>>,
+    by_id: DashMap<u64, Arc<ReadFlowState>>,
+    next_id: AtomicU64,
+    started_at: Arc<StdInstant>,
 }
 
 impl FlowsMap {
-    fn new() -> Self {
-        let shards = (0..READ_FLOW_MAP_SHARDS)
-            .map(|_| RwLock::new(FlowMapShard::new()))
-            .collect();
-        Self { shards }
+    fn new(started_at: Arc<StdInstant>) -> Self {
+        Self {
+            by_key: DashMap::new(),
+            by_id: DashMap::new(),
+            next_id: AtomicU64::new(1),
+            started_at,
+        }
     }
 
-    fn acquire(
-        &self,
-        flow_id: ReadFlowId,
-        flow_task_id: u64,
-        max_in_flight: usize,
-        initial_virtual_time_us: u64,
-    ) -> (Arc<ReadFlowState>, Arc<ReadFlowTaskState>) {
-        let mut shard = self.shards[flow_id.shard_id()].write().unwrap();
-        let state = shard
-            .flows
-            .entry(flow_id)
-            .or_insert_with(|| {
-                Arc::new(ReadFlowState {
-                    semaphore: Arc::new(Semaphore::new(max_in_flight)),
-                    refs: AtomicUsize::new(0),
-                    virtual_time_us: AtomicU64::new(initial_virtual_time_us),
-                    idle_since_us: AtomicU64::new(0),
-                })
-            })
-            .clone();
-        state.idle_since_us.store(0, Ordering::Release);
-        state.refs.fetch_add(1, Ordering::Relaxed);
-        let task_state = Arc::new(ReadFlowTaskState {
-            flow: state.clone(),
-            priority_us: AtomicU64::new(initial_virtual_time_us),
-        });
-        let old_task_state = shard.flow_task_ids.insert(flow_task_id, task_state.clone());
-        debug_assert!(old_task_state.is_none());
-        (state, task_state)
-    }
+    fn ensure(&self, flow_key: ReadFlowKey) -> Arc<ReadFlowState> {
+        loop {
+            if let Some(state_ref) = self.by_key.get(&flow_key) {
+                let state = state_ref.clone();
+                drop(state_ref);
+                match state.refs.load(Ordering::Acquire) {
+                    refs if refs >= 0 => {
+                        if state
+                            .refs
+                            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |refs| {
+                                (refs >= 0).then_some(refs.saturating_add(1))
+                            })
+                            .is_ok()
+                        {
+                            state.idle_since_us.store(0, Ordering::Release);
+                            return state;
+                        }
+                    }
+                    READ_FLOW_REFS_INITIALIZING => {
+                        std::hint::spin_loop();
+                    }
+                    READ_FLOW_REFS_DELETING => {
+                        self.remove_deleted_state(&state);
+                    }
+                    _ => {
+                        debug_assert!(false, "unexpected read flow refs state");
+                    }
+                }
+                continue;
+            }
 
-    fn get_by_flow_id(&self, flow_id: ReadFlowId) -> Option<Arc<ReadFlowState>> {
-        self.shards[flow_id.shard_id()]
-            .read()
-            .unwrap()
-            .flows
-            .get(&flow_id)
-            .cloned()
-    }
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            let state = Arc::new(ReadFlowState::new_initializing(
+                id,
+                flow_key,
+                self.elapsed_us(),
+            ));
 
-    fn get_by_task_id(&self, flow_task_id: u64) -> Option<Arc<ReadFlowTaskState>> {
-        self.shards[(flow_task_id & READ_FLOW_MAP_SHARD_MASK) as usize]
-            .read()
-            .unwrap()
-            .flow_task_ids
-            .get(&flow_task_id)
-            .cloned()
-    }
-
-    fn remove_task_id(&self, flow_task_id: u64) {
-        self.shards[(flow_task_id & READ_FLOW_MAP_SHARD_MASK) as usize]
-            .write()
-            .unwrap()
-            .flow_task_ids
-            .remove(&flow_task_id);
-    }
-
-    fn scan_min_virtual_time_us(
-        &self,
-        now_us: u64,
-        is_live: impl Fn(&ReadFlowState, u64) -> bool,
-    ) -> u64 {
-        let mut min_vt = u64::MAX;
-        for shard in &self.shards {
-            let shard = shard.read().unwrap();
-            for state in shard.flows.values() {
-                if is_live(state, now_us) {
-                    min_vt = min_vt.min(state.virtual_time_us.load(Ordering::Relaxed));
+            match self.by_key.entry(flow_key) {
+                dashmap::mapref::entry::Entry::Occupied(entry) => {
+                    let existing = entry.get().clone();
+                    drop(entry);
+                    match existing.refs.load(Ordering::Acquire) {
+                        refs if refs >= 0 => {
+                            if existing
+                                .refs
+                                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |refs| {
+                                    (refs >= 0).then_some(refs.saturating_add(1))
+                                })
+                                .is_ok()
+                            {
+                                existing.idle_since_us.store(0, Ordering::Release);
+                                return existing;
+                            }
+                        }
+                        READ_FLOW_REFS_INITIALIZING => {
+                            std::hint::spin_loop();
+                        }
+                        READ_FLOW_REFS_DELETING => {
+                            self.remove_deleted_state(&existing);
+                        }
+                        _ => {
+                            debug_assert!(false, "unexpected read flow refs state");
+                        }
+                    }
+                }
+                dashmap::mapref::entry::Entry::Vacant(entry) => {
+                    entry.insert(state.clone());
+                    self.by_id.insert(id, state.clone());
+                    state.refs.store(1, Ordering::Release);
+                    state.idle_since_us.store(0, Ordering::Release);
+                    return state;
                 }
             }
         }
-        if min_vt == u64::MAX { 0 } else { min_vt }
+    }
+
+    fn elapsed_us(&self) -> u64 {
+        self.started_at
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64
+    }
+
+    fn get_by_key(&self, flow_key: ReadFlowKey) -> Option<Arc<ReadFlowState>> {
+        self.by_key
+            .get(&flow_key)
+            .and_then(|state| (state.refs.load(Ordering::Acquire) >= 0).then(|| state.clone()))
+    }
+
+    fn get_by_id(&self, id: u64) -> Option<Arc<ReadFlowState>> {
+        self.by_id
+            .get(&id)
+            .and_then(|state| (state.refs.load(Ordering::Acquire) >= 0).then(|| state.clone()))
     }
 
     fn gc_expired_idle_flows(&self, now_us: u64, is_live: impl Fn(&ReadFlowState, u64) -> bool) {
-        for shard in &self.shards {
-            let mut shard = shard.write().unwrap();
-            let expired_flow_ids = shard
-                .flows
-                .iter()
-                .filter_map(|(flow_id, state)| (!is_live(state, now_us)).then_some(*flow_id))
-                .collect::<Vec<_>>();
-            for flow_id in expired_flow_ids {
-                if let Some(state) = shard.flows.remove(&flow_id) {
-                    shard
-                        .flow_task_ids
-                        .retain(|_, task_state| !Arc::ptr_eq(&state, &task_state.flow));
-                }
+        let expired_states = self
+            .by_key
+            .iter()
+            .filter_map(|entry| (!is_live(entry.value(), now_us)).then_some(entry.value().clone()))
+            .collect::<Vec<_>>();
+        for state in expired_states {
+            if state
+                .refs
+                .compare_exchange(
+                    0,
+                    READ_FLOW_REFS_DELETING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                self.remove_deleted_state(&state);
             }
         }
+    }
+
+    fn remove_deleted_state(&self, state: &Arc<ReadFlowState>) {
+        if state.refs.load(Ordering::Acquire) != READ_FLOW_REFS_DELETING {
+            return;
+        }
+        self.by_id
+            .remove_if(&state.id, |_, existing| Arc::ptr_eq(existing, state));
+        self.by_key
+            .remove_if(&state.key, |_, existing| Arc::ptr_eq(existing, state));
     }
 }
 
 #[derive(Clone)]
 pub struct ReadFlowController {
-    max_in_flight: usize,
+    worker_count: usize,
     flows: Arc<FlowsMap>,
-    next_flow_task_seq: Arc<AtomicU64>,
-    min_virtual_time_us: Arc<AtomicU64>,
-    min_virtual_time_updated_at_us: Arc<AtomicU64>,
+    slots: Arc<ReadFlowSlots>,
+    high_cpu_flows: Arc<Mutex<HashSet<ReadFlowKey>>>,
     last_idle_gc_at_us: Arc<AtomicU64>,
+    last_slot_migration_check_us: Arc<AtomicU64>,
     started_at: Arc<StdInstant>,
 }
 
 impl Default for ReadFlowController {
     fn default() -> Self {
-        Self::new(0)
+        Self::new()
     }
 }
 
 impl ReadFlowController {
-    fn new(max_in_flight: usize) -> Self {
+    fn new() -> Self {
+        Self::new_with_worker_count(1)
+    }
+
+    fn new_with_worker_count(worker_count: usize) -> Self {
+        let worker_count = worker_count.max(1);
+        let started_at = Arc::new(StdInstant::now());
         Self {
-            max_in_flight,
-            flows: Arc::new(FlowsMap::new()),
-            next_flow_task_seq: Arc::new(AtomicU64::new(1)),
-            min_virtual_time_us: Arc::new(AtomicU64::new(0)),
-            min_virtual_time_updated_at_us: Arc::new(AtomicU64::new(0)),
+            worker_count,
+            flows: Arc::new(FlowsMap::new(started_at.clone())),
+            slots: Arc::new(ReadFlowSlots::new()),
+            high_cpu_flows: Arc::new(Mutex::new(HashSet::new())),
             last_idle_gc_at_us: Arc::new(AtomicU64::new(0)),
-            started_at: Arc::new(StdInstant::now()),
+            last_slot_migration_check_us: Arc::new(AtomicU64::new(0)),
+            started_at,
         }
     }
 
-    async fn acquire(&self, flow_id: Option<ReadFlowId>) -> ReadFlowPermit {
-        let Some(flow_id) = flow_id else {
+    async fn acquire(&self, flow_key: Option<ReadFlowKey>) -> ReadFlowPermit {
+        let Some(flow_key) = flow_key else {
             return ReadFlowPermit::Noop;
         };
-        if self.max_in_flight == 0 {
-            return ReadFlowPermit::Noop;
-        }
 
-        let initial_virtual_time_us = self.cached_min_virtual_time_us();
-        let flow_task_id = self.next_flow_task_id(flow_id.shard_id());
-        let (state, task_state) = self.flows.acquire(
-            flow_id,
-            flow_task_id,
-            self.max_in_flight,
-            initial_virtual_time_us,
-        );
-        let semaphore = state.semaphore.clone();
+        let state = self.flows.ensure(flow_key);
         let flow_ref = ReadFlowRef {
             controller: self.clone(),
-            flow_id,
-            flow_task_id,
+            state: state.clone(),
         };
 
-        match semaphore.acquire_owned().await {
-            Ok(permit) => ReadFlowPermit::Limited {
-                permit: Some(permit),
-                flow_ref: Some(flow_ref),
-                state,
-                task_state,
-                flow_task_id,
-            },
-            // The semaphore is never closed. If that ever changes, fail open so
-            // reads are not permanently blocked.
-            Err(_) => ReadFlowPermit::Noop,
+        self.prepare_flow_slot_for_enqueue(flow_key, &state);
+        ReadFlowPermit::Limited {
+            flow_ref: Some(flow_ref),
+            state,
         }
     }
 
-    fn release_ref(&self, flow_id: ReadFlowId) {
-        let Some(state) = self.flows.get_by_flow_id(flow_id) else {
-            return;
-        };
+    fn release_ref(&self, state: &ReadFlowState) {
         let old_refs = state.refs.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(old_refs > 0);
 
@@ -315,55 +600,33 @@ impl ReadFlowController {
         }
     }
 
-    fn release_task_id(&self, flow_task_id: u64) {
-        self.flows.remove_task_id(flow_task_id);
-    }
-
-    fn next_flow_task_id(&self, shard_id: usize) -> u64 {
-        const FLOW_TASK_ID_MARKER: u64 = 1 << 63;
-        let seq = self.next_flow_task_seq.fetch_add(1, Ordering::Relaxed);
-        FLOW_TASK_ID_MARKER | (seq << READ_FLOW_MAP_SHARDS.trailing_zeros()) | shard_id as u64
-    }
-
     fn flow_priority_snapshot(&self, state: &ReadFlowState) -> ReadFlowPrioritySnapshot {
-        let min_vt = self.cached_min_virtual_time_us();
-        let max_vt = min_vt.saturating_add(MAX_READ_FLOW_VIRTUAL_TIME_LAG_US);
-        let vt = state
-            .virtual_time_us
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |vt| {
-                (vt > max_vt).then_some(max_vt)
-            })
-            .unwrap_or_else(|vt| vt);
-        let virtual_time_us = vt.min(max_vt);
+        let min_vt = self.slots.min_virtual_time_us();
+        let slot = self.current_slot(state);
+        let virtual_time_us = self.slots.get(slot).virtual_time_us.load(Ordering::Acquire);
         ReadFlowPrioritySnapshot {
             virtual_time_us,
             min_virtual_time_us: min_vt,
             priority: virtual_time_us,
+            throttled: slot.is_throttled(),
         }
     }
 
-    fn task_priority_snapshot(&self, task_state: &ReadFlowTaskState) -> ReadFlowPrioritySnapshot {
-        let min_vt = self.cached_min_virtual_time_us();
-        let max_vt = min_vt.saturating_add(MAX_READ_FLOW_VIRTUAL_TIME_LAG_US);
-        let vt = task_state.priority_us.load(Ordering::Acquire).min(max_vt);
+    fn task_priority_snapshot(&self, state: &ReadFlowState) -> ReadFlowPrioritySnapshot {
+        let min_vt = self.slots.min_virtual_time_us();
+        let slot = self.current_slot(state);
+        let vt = self.slots.get(slot).virtual_time_us.load(Ordering::Acquire);
         ReadFlowPrioritySnapshot {
             virtual_time_us: vt,
             min_virtual_time_us: min_vt,
             priority: vt,
+            throttled: slot.is_throttled(),
         }
     }
 
-    fn cached_min_virtual_time_us(&self) -> u64 {
-        self.min_virtual_time_us.load(Ordering::Acquire)
-    }
-
-    fn refresh_min_virtual_time_and_gc(&self) {
+    fn gc_expired_idle_flows(&self) {
         let now_us = self.elapsed_us();
         self.maybe_gc_expired_idle_flows(now_us);
-        let min_vt = self.scan_min_virtual_time_us_at(now_us);
-        self.min_virtual_time_us.store(min_vt, Ordering::Release);
-        self.min_virtual_time_updated_at_us
-            .store(now_us, Ordering::Release);
     }
 
     fn elapsed_us(&self) -> u64 {
@@ -373,20 +636,20 @@ impl ReadFlowController {
             .min(u128::from(u64::MAX)) as u64
     }
 
-    fn scan_min_virtual_time_us_at(&self, now_us: u64) -> u64 {
-        self.flows
-            .scan_min_virtual_time_us(now_us, |state, now_us| {
-                Self::is_active_or_recent_idle(state, now_us)
-            })
+    fn is_active(state: &ReadFlowState) -> bool {
+        state.refs.load(Ordering::Acquire) > 0
     }
 
     fn is_active_or_recent_idle(state: &ReadFlowState, now_us: u64) -> bool {
-        if state.refs.load(Ordering::Acquire) > 0 {
+        if Self::is_active(state) {
             return true;
         }
         let idle_since_us = state.idle_since_us.load(Ordering::Acquire);
-        idle_since_us != 0
-            && now_us.saturating_sub(idle_since_us) <= MAX_READ_FLOW_VIRTUAL_TIME_LAG_US
+        if idle_since_us != 0 {
+            now_us.saturating_sub(idle_since_us) <= MAX_READ_FLOW_VIRTUAL_TIME_LAG_US
+        } else {
+            now_us.saturating_sub(state.created_at_us) <= MAX_READ_FLOW_VIRTUAL_TIME_LAG_US
+        }
     }
 
     fn maybe_gc_expired_idle_flows(&self, now_us: u64) {
@@ -407,18 +670,188 @@ impl ReadFlowController {
         });
     }
 
-    fn flow_priority_tag_by_task_id(&self, flow_task_id: u64) -> Option<u64> {
-        self.flows
-            .get_by_task_id(flow_task_id)
-            .map(|task_state| self.task_priority_snapshot(&task_state).priority)
+    fn worker_window_capacity(&self, window_us: u64, percent: u64) -> u64 {
+        (self.worker_count as u64)
+            .saturating_mul(window_us)
+            .saturating_mul(percent)
+            .saturating_div(100)
     }
 
-    fn flow_priority_snapshot_by_flow_id(
+    fn current_slot(&self, state: &ReadFlowState) -> ReadFlowSlot {
+        ReadFlowSlot::from_throttled(state.throttled.load(Ordering::Acquire))
+    }
+
+    fn move_to_slot(&self, state: &ReadFlowState, slot: ReadFlowSlot, now_us: u64) {
+        state
+            .throttled
+            .store(slot.is_throttled(), Ordering::Release);
+        if slot == ReadFlowSlot::Throttled {
+            state.throttled_since_us.store(now_us, Ordering::Release);
+        } else {
+            state.throttled_since_us.store(0, Ordering::Release);
+        }
+    }
+
+    fn maybe_return_to_normal(&self, state: &ReadFlowState, now_us: u64) {
+        if self.current_slot(state) != ReadFlowSlot::Throttled {
+            return;
+        }
+        let throttled_since_us = state.throttled_since_us.load(Ordering::Acquire);
+        if throttled_since_us == 0
+            || now_us.saturating_sub(throttled_since_us) < MAX_READ_FLOW_VIRTUAL_TIME_LAG_US
+        {
+            return;
+        }
+        let cpu_us = state.window_cpu_us(now_us);
+        if cpu_us
+            <= self
+                .worker_window_capacity(READ_FLOW_CPU_WINDOW_US, READ_FLOW_THROTTLED_RETURN_PERCENT)
+        {
+            self.move_to_slot(state, ReadFlowSlot::Normal, now_us);
+        }
+    }
+
+    fn prepare_flow_slot_for_enqueue(
         &self,
-        flow_id: ReadFlowId,
+        flow_key: ReadFlowKey,
+        state: &ReadFlowState,
+    ) -> ReadFlowSlot {
+        let cpu_start = ThreadTime::now();
+        let now_us = self.elapsed_us();
+        self.maybe_return_to_normal(state, now_us);
+        let recent_cpu_us = state.recent_cpu_us(now_us);
+        if recent_cpu_us
+            >= self.worker_window_capacity(
+                READ_FLOW_RECENT_CPU_WINDOW_US,
+                READ_FLOW_RECENT_THROTTLE_PERCENT,
+            )
+        {
+            self.move_to_slot(state, ReadFlowSlot::Throttled, now_us);
+            self.high_cpu_flows.lock().unwrap().insert(flow_key);
+        }
+        self.maybe_migrate_flows(now_us);
+        add_read_flow_control_cpu_time(cpu_start.elapsed());
+        self.current_slot(state)
+    }
+
+    fn update_cpu_windows(&self, flow_key: ReadFlowKey, state: &ReadFlowState, cpu_us: u64) {
+        if cpu_us == 0 {
+            return;
+        }
+        let now_us = self.elapsed_us();
+        state.add_cpu(now_us, cpu_us);
+        self.slots
+            .get(self.current_slot(state))
+            .cpu_window
+            .add(now_us, cpu_us);
+        self.update_high_cpu_candidate(flow_key, state, now_us);
+        self.maybe_migrate_flows(now_us);
+    }
+
+    fn update_high_cpu_candidate(&self, flow_key: ReadFlowKey, state: &ReadFlowState, now_us: u64) {
+        let cpu_us = state.window_cpu_us(now_us);
+        let enter_threshold =
+            self.worker_window_capacity(READ_FLOW_CPU_WINDOW_US, READ_FLOW_HIGH_CPU_ENTER_PERCENT);
+        let exit_threshold =
+            self.worker_window_capacity(READ_FLOW_CPU_WINDOW_US, READ_FLOW_HIGH_CPU_EXIT_PERCENT);
+        let mut high_cpu_flows = self.high_cpu_flows.lock().unwrap();
+        if cpu_us >= enter_threshold {
+            high_cpu_flows.insert(flow_key);
+        } else if cpu_us <= exit_threshold {
+            high_cpu_flows.remove(&flow_key);
+        }
+    }
+
+    fn maybe_migrate_flows(&self, now_us: u64) {
+        let last_check_us = self.last_slot_migration_check_us.load(Ordering::Acquire);
+        if now_us.saturating_sub(last_check_us) < READ_FLOW_SLOT_MIGRATION_CHECK_INTERVAL_US {
+            return;
+        }
+        if self
+            .last_slot_migration_check_us
+            .compare_exchange(last_check_us, now_us, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let normal_cpu_us = self.slots.normal.cpu_window.total(now_us);
+        let throttled_cpu_us = self.slots.throttled.cpu_window.total(now_us);
+        let total_cpu_us = normal_cpu_us.saturating_add(throttled_cpu_us);
+        if total_cpu_us
+            <= self.worker_window_capacity(READ_FLOW_CPU_WINDOW_US, READ_FLOW_POOL_BUSY_PERCENT)
+        {
+            return;
+        }
+        let normal_limit_us = self.worker_window_capacity(
+            READ_FLOW_CPU_WINDOW_US,
+            READ_FLOW_NORMAL_SLOT_SHARE_PERCENT * READ_FLOW_POOL_BUSY_PERCENT / 100,
+        );
+        if normal_cpu_us <= normal_limit_us {
+            return;
+        }
+
+        let mut stale_flows = Vec::new();
+        let mut candidates = Vec::new();
+        {
+            let high_cpu_flows = self.high_cpu_flows.lock().unwrap();
+            for flow_key in high_cpu_flows.iter().copied() {
+                let Some(state) = self.flows.get_by_key(flow_key) else {
+                    stale_flows.push(flow_key);
+                    continue;
+                };
+                self.maybe_return_to_normal(&state, now_us);
+                let cpu_us = state.window_cpu_us(now_us);
+                if cpu_us
+                    >= self.worker_window_capacity(
+                        READ_FLOW_CPU_WINDOW_US,
+                        READ_FLOW_HIGH_CPU_ENTER_PERCENT,
+                    )
+                {
+                    candidates.push((flow_key, state, cpu_us));
+                } else if cpu_us
+                    <= self.worker_window_capacity(
+                        READ_FLOW_CPU_WINDOW_US,
+                        READ_FLOW_HIGH_CPU_EXIT_PERCENT,
+                    )
+                {
+                    stale_flows.push(flow_key);
+                }
+            }
+        }
+        if !stale_flows.is_empty() {
+            let mut high_cpu_flows = self.high_cpu_flows.lock().unwrap();
+            for flow_key in stale_flows {
+                high_cpu_flows.remove(&flow_key);
+            }
+        }
+
+        candidates.sort_by_key(|(_, _, cpu_us)| std::cmp::Reverse(*cpu_us));
+        let mut migrated_cpu_us = 0_u64;
+        let target_cpu_us = normal_cpu_us.saturating_sub(normal_limit_us);
+        for (_, state, cpu_us) in candidates {
+            if self.current_slot(&state) == ReadFlowSlot::Normal {
+                self.move_to_slot(&state, ReadFlowSlot::Throttled, now_us);
+                migrated_cpu_us = migrated_cpu_us.saturating_add(cpu_us);
+                if migrated_cpu_us >= target_cpu_us {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn flow_priority_tag_by_task_id(&self, flow_key: u64) -> Option<u64> {
+        self.flows
+            .get_by_id(flow_key)
+            .map(|state| self.task_priority_snapshot(&state).priority)
+    }
+
+    fn flow_priority_snapshot_by_key(
+        &self,
+        flow_key: ReadFlowKey,
     ) -> Option<ReadFlowPrioritySnapshot> {
         self.flows
-            .get_by_flow_id(flow_id)
+            .get_by_key(flow_key)
             .map(|state| self.flow_priority_snapshot(&state))
     }
 }
@@ -426,8 +859,8 @@ impl ReadFlowController {
 fn spawn_read_flow_scanner(pool: &yatp::ThreadPool<TaskCell>, flow_controller: ReadFlowController) {
     let scanner = async move {
         loop {
-            futures_timer::Delay::new(READ_FLOW_SCAN_INTERVAL).await;
-            flow_controller.refresh_min_virtual_time_and_gc();
+            futures_timer::Delay::new(READ_FLOW_GC_CHECK_INTERVAL).await;
+            flow_controller.gc_expired_idle_flows();
         }
     };
     let extras = Extras::new_multilevel(u64::MAX, Some(0));
@@ -454,25 +887,20 @@ impl TaskPriorityProvider for FlowPriorityProvider {
 
 struct ReadFlowRef {
     controller: ReadFlowController,
-    flow_id: ReadFlowId,
-    flow_task_id: u64,
+    state: Arc<ReadFlowState>,
 }
 
 impl Drop for ReadFlowRef {
     fn drop(&mut self) {
-        self.controller.release_task_id(self.flow_task_id);
-        self.controller.release_ref(self.flow_id);
+        self.controller.release_ref(&self.state);
     }
 }
 
 enum ReadFlowPermit {
     Noop,
     Limited {
-        permit: Option<OwnedSemaphorePermit>,
         flow_ref: Option<ReadFlowRef>,
         state: Arc<ReadFlowState>,
-        task_state: Arc<ReadFlowTaskState>,
-        flow_task_id: u64,
     },
 }
 
@@ -480,27 +908,28 @@ impl ReadFlowPermit {
     fn yatp_task_id(&self, fallback: u64) -> u64 {
         match self {
             ReadFlowPermit::Noop => fallback,
-            ReadFlowPermit::Limited { flow_task_id, .. } => *flow_task_id,
+            ReadFlowPermit::Limited { state, .. } => state.id,
         }
     }
 
     fn charge_us(&self, delta: u64) {
         let ReadFlowPermit::Limited {
-            state, task_state, ..
+            flow_ref, state, ..
         } = self
         else {
             return;
         };
-        let charged_to_vt = state
-            .virtual_time_us
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |vt| {
-                Some(vt.saturating_add(delta))
-            })
-            .map(|old_vt| old_vt.saturating_add(delta))
-            .unwrap_or_else(|old_vt| old_vt);
-        task_state
-            .priority_us
-            .store(charged_to_vt, Ordering::Release);
+        let Some(flow_ref) = flow_ref else {
+            return;
+        };
+        let slot = flow_ref
+            .controller
+            .prepare_flow_slot_for_enqueue(state.key, state);
+        flow_ref
+            .controller
+            .slots
+            .get(slot)
+            .charge(delta, slot.weight());
     }
 
     fn precharge(&self, duration: Duration) -> u64 {
@@ -517,6 +946,16 @@ impl ReadFlowPermit {
     ) {
         let delta = duration.as_micros().min(u128::from(u64::MAX)) as u64;
         *actual_cpu_us = actual_cpu_us.saturating_add(delta);
+        if let ReadFlowPermit::Limited {
+            flow_ref: Some(flow_ref),
+            state,
+            ..
+        } = self
+        {
+            flow_ref
+                .controller
+                .update_cpu_windows(state.key, state, delta);
+        }
         if *actual_cpu_us > *charged_cpu_us {
             let charge = actual_cpu_us.saturating_sub(*charged_cpu_us);
             self.charge_us(charge);
@@ -527,11 +966,7 @@ impl ReadFlowPermit {
 
 impl Drop for ReadFlowPermit {
     fn drop(&mut self) {
-        if let ReadFlowPermit::Limited {
-            permit, flow_ref, ..
-        } = self
-        {
-            permit.take();
+        if let ReadFlowPermit::Limited { flow_ref, .. } = self {
             flow_ref.take();
         }
     }
@@ -572,15 +1007,17 @@ impl<F: Future> Future for FlowTrackedFuture<F> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
+        reset_read_flow_control_cpu_time();
         let start_time = ThreadTime::now();
         let poll = this.future.poll(cx);
+        let flow_control_cpu_time = take_read_flow_control_cpu_time();
+        let actual_cpu_time = start_time
+            .elapsed()
+            .checked_sub(flow_control_cpu_time)
+            .unwrap_or_default();
 
         if let Some(flow_permit) = this.flow_permit.as_ref() {
-            flow_permit.record_elapsed(
-                start_time.elapsed(),
-                this.actual_cpu_us,
-                this.charged_cpu_us,
-            );
+            flow_permit.record_elapsed(actual_cpu_time, this.actual_cpu_us, this.charged_cpu_us);
             if poll.is_pending() {
                 *this.charged_cpu_us = (*this.charged_cpu_us)
                     .saturating_add(flow_permit.precharge(*this.estimated_poll_cpu));
@@ -765,13 +1202,13 @@ async fn admission_and_enqueue(
 impl ReadPoolHandle {
     pub fn read_flow_priority_snapshot(
         &self,
-        flow_id: Option<ReadFlowId>,
+        flow_key: Option<ReadFlowKey>,
     ) -> Option<ReadFlowPrioritySnapshot> {
-        let flow_id = flow_id?;
+        let flow_key = flow_key?;
         match self {
             ReadPoolHandle::YatpFlowControl {
                 flow_controller, ..
-            } => flow_controller.flow_priority_snapshot_by_flow_id(flow_id),
+            } => flow_controller.flow_priority_snapshot_by_key(flow_key),
             _ => None,
         }
     }
@@ -805,7 +1242,7 @@ impl ReadPoolHandle {
         task_id: u64,
         metadata: TaskMetadata<'_>,
         resource_limiter: Option<Arc<ResourceLimiter>>,
-        flow_id: Option<ReadFlowId>,
+        flow_key: Option<ReadFlowKey>,
     ) -> BoxFuture<'static, Result<(), ReadPoolError>>
     where
         F: Future<Output = ()> + Send + 'static,
@@ -816,7 +1253,7 @@ impl ReadPoolHandle {
             task_id,
             metadata,
             resource_limiter,
-            flow_id,
+            flow_key,
             Duration::ZERO,
         )
     }
@@ -828,7 +1265,7 @@ impl ReadPoolHandle {
         task_id: u64,
         metadata: TaskMetadata<'_>,
         resource_limiter: Option<Arc<ResourceLimiter>>,
-        flow_id: Option<ReadFlowId>,
+        flow_key: Option<ReadFlowKey>,
         estimated_cpu: Duration,
     ) -> BoxFuture<'static, Result<(), ReadPoolError>>
     where
@@ -941,7 +1378,7 @@ impl ReadPoolHandle {
                 let flow_controller = flow_controller.clone();
                 let max_tasks = *max_tasks;
                 async move {
-                    let flow_permit = flow_controller.acquire(flow_id).await;
+                    let flow_permit = flow_controller.acquire(flow_key).await;
                     let yatp_task_id = flow_permit.yatp_task_id(task_id);
                     let mut extras = Extras::new_multilevel(yatp_task_id, fixed_level);
                     extras.set_metadata(metadata.to_vec());
@@ -997,7 +1434,7 @@ impl ReadPoolHandle {
         task_id: u64,
         metadata: TaskMetadata<'_>,
         resource_limiter: Option<Arc<ResourceLimiter>>,
-        flow_id: Option<ReadFlowId>,
+        flow_key: Option<ReadFlowKey>,
     ) -> impl Future<Output = Result<T, ReadPoolError>>
     where
         F: Future<Output = T> + Send + 'static,
@@ -1009,7 +1446,7 @@ impl ReadPoolHandle {
             task_id,
             metadata,
             resource_limiter,
-            flow_id,
+            flow_key,
             Duration::ZERO,
         )
     }
@@ -1021,7 +1458,7 @@ impl ReadPoolHandle {
         task_id: u64,
         metadata: TaskMetadata<'_>,
         resource_limiter: Option<Arc<ResourceLimiter>>,
-        flow_id: Option<ReadFlowId>,
+        flow_key: Option<ReadFlowKey>,
         estimated_cpu: Duration,
     ) -> impl Future<Output = Result<T, ReadPoolError>>
     where
@@ -1037,7 +1474,7 @@ impl ReadPoolHandle {
             task_id,
             metadata,
             resource_limiter,
-            flow_id,
+            flow_key,
             estimated_cpu,
         );
         async move {
@@ -1347,8 +1784,8 @@ pub fn build_yatp_read_pool_with_name<E: Engine, R: FlowStatsReporter>(
         .enable_task_wait_metrics(enable_task_wait_metrics);
 
     let enable_flow_control = config.enable_flow_fairness;
-    let flow_controller =
-        enable_flow_control.then(|| ReadFlowController::new(config.max_flow_concurrency));
+    let flow_controller = enable_flow_control
+        .then(|| ReadFlowController::new_with_worker_count(config.max_thread_count));
     let pool = if enable_flow_control {
         builder.build_priority_pool(Arc::new(FlowPriorityProvider::new(
             flow_controller.as_ref().unwrap().clone(),
@@ -1404,7 +1841,7 @@ pub fn build_yatp_flow_control_read_pool(
     cleanup_method: CleanupMethod,
     enable_task_wait_metrics: bool,
 ) -> ReadPool {
-    let flow_controller = ReadFlowController::new(config.max_flow_concurrency);
+    let flow_controller = ReadFlowController::new_with_worker_count(config.max_thread_count);
     let pool = YatpPoolBuilder::new(DefaultTicker::default())
         .name_prefix(&unified_read_pool_name)
         .cleanup_method(cleanup_method)
@@ -1848,6 +2285,12 @@ mod tests {
         let mut actual_cpu_us = 0;
         let mut charged_cpu_us = 0;
         permit.record_elapsed(duration, &mut actual_cpu_us, &mut charged_cpu_us);
+    }
+
+    fn normal_slot_vt(duration: Duration) -> u64 {
+        (duration.as_micros() as u64)
+            .saturating_mul(100)
+            .saturating_div(READ_FLOW_NORMAL_SLOT_WEIGHT)
     }
 
     #[derive(Clone)]
@@ -2446,18 +2889,17 @@ mod tests {
     }
 
     #[test]
-    fn test_yatp_read_flow_concurrency_limit() {
+    fn test_yatp_read_flow_normal_slot_has_no_concurrency_limit() {
         let config = UnifiedReadPoolConfig {
             min_thread_count: 1,
             max_thread_count: 2,
             max_tasks_per_worker: 4,
             enable_flow_fairness: true,
-            max_flow_concurrency: 1,
             ..Default::default()
         };
 
         let engine = TestEngineBuilder::new().build().unwrap();
-        let name = "test-yatp-read-flow-concurrency-limit";
+        let name = "test-yatp-read-flow-normal-slot-has-no-concurrency-limit";
         let pool = build_yatp_read_pool_with_name(
             &config,
             DummyReporter,
@@ -2469,7 +2911,7 @@ mod tests {
             false,
         );
         let handle = pool.handle();
-        let flow_id = ReadFlowId::new(42, 7);
+        let flow_key = ReadFlowKey::new(42, 7);
 
         let (block_tx, block_rx) = std::sync::mpsc::channel::<()>();
         let task1 = async move {
@@ -2481,143 +2923,118 @@ mod tests {
             1,
             TaskMetadata::default(),
             None,
-            flow_id,
+            flow_key,
         ))
         .unwrap();
 
         let (spawned_tx, spawned_rx) = std::sync::mpsc::channel::<()>();
+        let (block2_tx, block2_rx) = std::sync::mpsc::channel::<()>();
         let handle2 = handle.clone();
         let join = thread::spawn(move || {
             block_on(handle2.spawn_with_flow(
                 async move {
                     let _ = spawned_tx.send(());
+                    let _ = block2_rx.recv();
                 },
                 CommandPri::Normal,
                 2,
                 TaskMetadata::default(),
                 None,
-                flow_id,
+                flow_key,
             ))
             .unwrap();
         });
 
-        thread::sleep(Duration::from_millis(300));
-        assert!(spawned_rx.try_recv().is_err());
+        spawned_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("normal slot should not use per-flow concurrency limiting");
         assert_eq!(
             UNIFIED_READ_POOL_RUNNING_TASKS
                 .with_label_values(&[name, "medium"])
                 .get(),
-            1
+            2
         );
 
         block_tx.send(()).unwrap();
-        spawned_rx
-            .recv_timeout(Duration::from_secs(3))
-            .expect("second task should enter the pool after the first flow slot is released");
+        block2_tx.send(()).unwrap();
         join.join().unwrap();
     }
 
     #[test]
-    fn test_read_flow_virtual_time_affects_priority() {
-        let controller = ReadFlowController::new(8);
-        let flow1 = ReadFlowId::new(42, 7).unwrap();
-        let flow2 = ReadFlowId::new(43, 7).unwrap();
-        let flow3 = ReadFlowId::new(44, 7).unwrap();
+    fn test_read_flow_slot_virtual_time_affects_priority() {
+        let controller = ReadFlowController::new();
+        let flow1 = ReadFlowKey::new(42, 7).unwrap();
+        let flow2 = ReadFlowKey::new(43, 7).unwrap();
 
         let flow1_first = block_on(controller.acquire(Some(flow1)));
         let flow2_first = block_on(controller.acquire(Some(flow2)));
         let flow1_task_id = flow1_first.yatp_task_id(1);
         let flow2_task_id = flow2_first.yatp_task_id(2);
-        assert_ne!(flow1_task_id, flow1.yatp_task_id());
+        assert_ne!(flow1_task_id, flow2_task_id);
+
+        record_flow_elapsed(&flow1_first, Duration::from_millis(10));
+        flow2_first.precharge(Duration::from_millis(10));
+
         assert_eq!(
             controller.flow_priority_tag_by_task_id(flow1_task_id),
-            Some(0)
+            Some(normal_slot_vt(Duration::from_millis(20)))
         );
-
-        record_flow_elapsed(&flow1_first, Duration::from_millis(1500));
-
         assert_eq!(
             controller.flow_priority_tag_by_task_id(flow2_task_id),
-            Some(0)
-        );
-        assert_eq!(
-            controller.flow_priority_tag_by_task_id(flow1_task_id),
-            Some(MAX_READ_FLOW_VIRTUAL_TIME_LAG_US)
-        );
-
-        drop(flow2_first);
-        controller.refresh_min_virtual_time_and_gc();
-        let flow3_first = block_on(controller.acquire(Some(flow3)));
-        let flow3_task_id = flow3_first.yatp_task_id(3);
-        assert_eq!(
-            controller.flow_priority_tag_by_task_id(flow3_task_id),
-            Some(0)
-        );
-        assert_eq!(
-            controller.flow_priority_tag_by_task_id(flow1_task_id),
-            Some(MAX_READ_FLOW_VIRTUAL_TIME_LAG_US)
+            Some(normal_slot_vt(Duration::from_millis(20)))
         );
     }
 
     #[test]
-    fn test_read_flow_starts_from_active_min_virtual_time() {
-        let controller = ReadFlowController::new(8);
-        let flow1 = ReadFlowId::new(42, 7).unwrap();
-        let flow2 = ReadFlowId::new(43, 7).unwrap();
+    fn test_read_flow_recent_cpu_moves_to_throttled_slot() {
+        let controller = ReadFlowController::new_with_worker_count(1);
+        let flow = ReadFlowKey::new(42, 7).unwrap();
+        let permit = block_on(controller.acquire(Some(flow)));
 
-        let flow1_first = block_on(controller.acquire(Some(flow1)));
-        record_flow_elapsed(&flow1_first, Duration::from_millis(150));
+        record_flow_elapsed(&permit, Duration::from_millis(25));
 
-        let flow1_task_id = flow1_first.yatp_task_id(1);
-        controller.refresh_min_virtual_time_and_gc();
-        let flow2_first = block_on(controller.acquire(Some(flow2)));
-        let flow2_task_id = flow2_first.yatp_task_id(2);
-        let flow1_priority = controller
-            .flow_priority_tag_by_task_id(flow1_task_id)
-            .unwrap();
-        let flow2_priority = controller
-            .flow_priority_tag_by_task_id(flow2_task_id)
-            .unwrap();
-        assert_eq!(flow1_priority, flow2_priority);
+        let ReadFlowPermit::Limited { state, .. } = &permit else {
+            unreachable!();
+        };
         assert_eq!(
-            flow1_priority,
-            Duration::from_millis(150).as_micros() as u64
+            controller.prepare_flow_slot_for_enqueue(flow, state),
+            ReadFlowSlot::Throttled
         );
     }
 
     #[test]
-    fn test_read_flow_keeps_recent_idle_virtual_time() {
-        let controller = ReadFlowController::new(8);
-        let flow1 = ReadFlowId::new(42, 7).unwrap();
-        let flow2 = ReadFlowId::new(43, 7).unwrap();
+    fn test_read_flow_slot_weight_changes_priority_growth() {
+        let controller = ReadFlowController::new();
+        let normal_flow = ReadFlowKey::new(42, 7).unwrap();
+        let throttled_flow = ReadFlowKey::new(43, 7).unwrap();
+        let normal = block_on(controller.acquire(Some(normal_flow)));
+        let throttled = block_on(controller.acquire(Some(throttled_flow)));
+        let normal_task_id = normal.yatp_task_id(1);
+        let throttled_task_id = throttled.yatp_task_id(2);
 
-        let flow1_first = block_on(controller.acquire(Some(flow1)));
-        record_flow_elapsed(&flow1_first, Duration::from_millis(150));
-        drop(flow1_first);
+        let ReadFlowPermit::Limited { state, .. } = &throttled else {
+            unreachable!();
+        };
+        controller.move_to_slot(state, ReadFlowSlot::Throttled, controller.elapsed_us());
 
-        controller.refresh_min_virtual_time_and_gc();
+        normal.precharge(Duration::from_millis(10));
+        throttled.precharge(Duration::from_millis(10));
 
-        let flow1_again = block_on(controller.acquire(Some(flow1)));
-        let flow1_again_task_id = flow1_again.yatp_task_id(1);
         assert_eq!(
-            controller.flow_priority_tag_by_task_id(flow1_again_task_id),
-            Some(Duration::from_millis(150).as_micros() as u64)
+            controller.flow_priority_tag_by_task_id(normal_task_id),
+            Some(12_500)
         );
-        drop(flow1_again);
-
-        let flow2_first = block_on(controller.acquire(Some(flow2)));
-        let flow2_task_id = flow2_first.yatp_task_id(2);
         assert_eq!(
-            controller.flow_priority_tag_by_task_id(flow2_task_id),
-            Some(Duration::from_millis(150).as_micros() as u64)
+            controller.flow_priority_tag_by_task_id(throttled_task_id),
+            Some(50_000)
         );
     }
 
     #[test]
     fn test_flow_priority_provider_recomputes_priority() {
-        let controller = ReadFlowController::new(8);
-        let flow1 = ReadFlowId::new(42, 7).unwrap();
-        let flow2 = ReadFlowId::new(43, 7).unwrap();
+        let controller = ReadFlowController::new();
+        let flow1 = ReadFlowKey::new(42, 7).unwrap();
+        let flow2 = ReadFlowKey::new(43, 7).unwrap();
         let flow1_permit = block_on(controller.acquire(Some(flow1)));
         let _flow2_permit = block_on(controller.acquire(Some(flow2)));
 
@@ -2647,7 +3064,10 @@ mod tests {
             type Output = ();
 
             fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
-                thread::sleep(Duration::from_millis(5));
+                let start = ThreadTime::now();
+                while start.elapsed() < Duration::from_millis(2) {
+                    std::hint::black_box(());
+                }
                 if self.first_poll {
                     self.first_poll = false;
                     Poll::Pending
@@ -2657,9 +3077,9 @@ mod tests {
             }
         }
 
-        let controller = ReadFlowController::new(1);
-        let flow = ReadFlowId::new(42, 7).unwrap();
-        let peer_flow = ReadFlowId::new(43, 7).unwrap();
+        let controller = ReadFlowController::new();
+        let flow = ReadFlowKey::new(42, 7).unwrap();
+        let peer_flow = ReadFlowKey::new(43, 7).unwrap();
         let flow_permit = block_on(controller.acquire(Some(flow)));
         let _peer_flow_permit = block_on(controller.acquire(Some(peer_flow)));
         let gauge = IntGauge::new(
@@ -2695,9 +3115,9 @@ mod tests {
 
     #[test]
     fn test_flow_tracked_future_precharges_estimated_cpu() {
-        let controller = ReadFlowController::new(1);
-        let flow = ReadFlowId::new(42, 7).unwrap();
-        let peer_flow = ReadFlowId::new(43, 7).unwrap();
+        let controller = ReadFlowController::new();
+        let flow = ReadFlowKey::new(42, 7).unwrap();
+        let peer_flow = ReadFlowKey::new(43, 7).unwrap();
         let flow_permit = block_on(controller.acquire(Some(flow)));
         let _peer_flow_permit = block_on(controller.acquire(Some(peer_flow)));
         let gauge = IntGauge::new(
@@ -2717,7 +3137,7 @@ mod tests {
 
         assert_eq!(
             controller.flow_priority_tag_by_task_id(flow_task_id),
-            Some(Duration::from_millis(50).as_micros() as u64)
+            Some(normal_slot_vt(Duration::from_millis(50)))
         );
 
         futures::pin_mut!(tracked_future);
@@ -2727,7 +3147,7 @@ mod tests {
         assert_eq!(gauge.get(), 0);
         assert_eq!(
             controller.flow_priority_tag_by_task_id(flow_task_id),
-            Some(Duration::from_millis(50).as_micros() as u64)
+            Some(normal_slot_vt(Duration::from_millis(50)))
         );
     }
 
@@ -2750,8 +3170,8 @@ mod tests {
             }
         }
 
-        let controller = ReadFlowController::new(1);
-        let flow = ReadFlowId::new(42, 7).unwrap();
+        let controller = ReadFlowController::new();
+        let flow = ReadFlowKey::new(42, 7).unwrap();
         let flow_permit = block_on(controller.acquire(Some(flow)));
         let gauge = IntGauge::new(
             "test_flow_tracked_future_precharges_next_poll",
@@ -2773,27 +3193,27 @@ mod tests {
 
         assert_eq!(
             controller.flow_priority_tag_by_task_id(flow_task_id),
-            Some(Duration::from_millis(50).as_micros() as u64)
+            Some(normal_slot_vt(Duration::from_millis(50)))
         );
 
         assert!(tracked_future.as_mut().poll(&mut cx).is_pending());
         assert_eq!(
             controller.flow_priority_tag_by_task_id(flow_task_id),
-            Some(Duration::from_millis(100).as_micros() as u64)
+            Some(normal_slot_vt(Duration::from_millis(100)))
         );
 
         assert!(tracked_future.as_mut().poll(&mut cx).is_ready());
         assert_eq!(gauge.get(), 0);
         assert_eq!(
             controller.flow_priority_tag_by_task_id(flow_task_id),
-            Some(Duration::from_millis(100).as_micros() as u64)
+            Some(normal_slot_vt(Duration::from_millis(100)))
         );
     }
 
     #[test]
-    fn test_read_flow_concurrent_tasks_keep_own_precharged_priority() {
-        let controller = ReadFlowController::new(8);
-        let flow = ReadFlowId::new(42, 7).unwrap();
+    fn test_read_flow_concurrent_tasks_share_flow_priority() {
+        let controller = ReadFlowController::new();
+        let flow = ReadFlowKey::new(42, 7).unwrap();
         let first = block_on(controller.acquire(Some(flow)));
         let second = block_on(controller.acquire(Some(flow)));
         let first_task_id = first.yatp_task_id(1);
@@ -2804,11 +3224,11 @@ mod tests {
 
         assert_eq!(
             controller.flow_priority_tag_by_task_id(first_task_id),
-            Some(Duration::from_millis(10).as_micros() as u64)
+            Some(normal_slot_vt(Duration::from_millis(20)))
         );
         assert_eq!(
             controller.flow_priority_tag_by_task_id(second_task_id),
-            Some(Duration::from_millis(20).as_micros() as u64)
+            Some(normal_slot_vt(Duration::from_millis(20)))
         );
     }
 }

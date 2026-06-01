@@ -50,7 +50,7 @@ use crate::{
         cache::CachedRequestHandler, interceptors::*, metrics::*,
         statistics::analyze_context::AnalyzeContext, tracker::Tracker, *,
     },
-    read_pool::{ReadFlowId, ReadPoolHandle},
+    read_pool::{ReadFlowKey, ReadPoolHandle},
     server::Config,
     storage::{
         self, Engine, Snapshot, SnapshotStore,
@@ -587,7 +587,7 @@ impl<E: Engine> Endpoint<E> {
         let req_ctx = r.req_ctx;
         let priority = req_ctx.context.get_priority();
         let task_id = req_ctx.build_task_id();
-        let flow_id = ReadFlowId::new(
+        let flow_key = ReadFlowKey::new(
             req_ctx.txn_start_ts.into_inner(),
             req_ctx.context.get_task_id(),
         );
@@ -631,7 +631,7 @@ impl<E: Engine> Endpoint<E> {
             future,
             priority,
             task_id,
-            flow_id,
+            flow_key,
             metadata,
             resource_limiter,
         );
@@ -908,7 +908,7 @@ impl<E: Engine> Endpoint<E> {
         let mut allocated_bytes = resource_tag.approximate_heap_size();
 
         let task_id = req_ctx.build_task_id();
-        let flow_id = ReadFlowId::new(
+        let flow_key = ReadFlowKey::new(
             req_ctx.txn_start_ts.into_inner(),
             req_ctx.context.get_task_id(),
         );
@@ -929,7 +929,7 @@ impl<E: Engine> Endpoint<E> {
             future,
             priority,
             task_id,
-            flow_id,
+            flow_key,
             metadata,
             resource_limiter,
         )?;
@@ -982,7 +982,7 @@ impl<E: Engine> Endpoint<E> {
         future: F,
         priority: CommandPri,
         task_id: u64,
-        flow_id: Option<ReadFlowId>,
+        flow_key: Option<ReadFlowKey>,
         metadata: TaskMetadata<'_>,
         resource_limiter: Option<Arc<ResourceLimiter>>,
     ) -> Result<BoxFuture<'static, Result<()>>>
@@ -998,7 +998,7 @@ impl<E: Engine> Endpoint<E> {
         });
         Ok(self
             .read_pool
-            .spawn_with_flow(fut, priority, task_id, metadata, resource_limiter, flow_id)
+            .spawn_with_flow(fut, priority, task_id, metadata, resource_limiter, flow_key)
             .map(|r| r.map_err(|_| Error::MaxPendingTasksExceeded))
             .boxed())
     }
