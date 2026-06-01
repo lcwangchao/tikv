@@ -201,6 +201,7 @@ struct QueryEvent {
     total_schedule_wait: Duration,
     first_schedule_wait: Duration,
     acquire_wait: Duration,
+    rx_wake_delay: Duration,
     subtasks: usize,
     errors: usize,
     slow_query_latency: Duration,
@@ -220,6 +221,9 @@ struct QueryTaskEvent {
     schedule_waits_us: Vec<u64>,
     cpu_us: u64,
     cpu_slices_us: Vec<u64>,
+    cpu_wall_us: u64,
+    cpu_wall_slices_us: Vec<u64>,
+    rx_wake_delay_us: u64,
     priority_snapshots: Vec<Option<ReadFlowPrioritySnapshot>>,
 }
 
@@ -289,6 +293,9 @@ struct SubTaskResult {
     schedule_waits_us: Vec<u64>,
     cpu_us: u64,
     cpu_slices_us: Vec<u64>,
+    cpu_wall_us: u64,
+    cpu_wall_slices_us: Vec<u64>,
+    completed_at: Instant,
     priority_snapshots: Vec<Option<ReadFlowPrioritySnapshot>>,
 }
 
@@ -305,6 +312,8 @@ struct SimSubtask {
     schedule_waits_us: Vec<u64>,
     cpu_us: u64,
     cpu_slices_us: Vec<u64>,
+    cpu_wall_us: u64,
+    cpu_wall_slices_us: Vec<u64>,
     priority_snapshots: Vec<Option<ReadFlowPrioritySnapshot>>,
 }
 
@@ -341,6 +350,8 @@ impl SimSubtask {
             schedule_waits_us: Vec::with_capacity(capacity),
             cpu_us: 0,
             cpu_slices_us: Vec::with_capacity(capacity),
+            cpu_wall_us: 0,
+            cpu_wall_slices_us: Vec::with_capacity(capacity),
             priority_snapshots: Vec::with_capacity(capacity),
         }
     }
@@ -386,10 +397,14 @@ impl Future for SimSubtask {
             self.remaining_cpu
         };
         let stop = self.stop.clone();
+        let cpu_wall_started_at = Instant::now();
         let cpu_us = burn_cpu(current, Some(&stop));
+        let cpu_wall_us = cpu_wall_started_at.elapsed().as_micros() as u64;
         self.cpu_us = self.cpu_us.saturating_add(cpu_us);
+        self.cpu_wall_us = self.cpu_wall_us.saturating_add(cpu_wall_us);
         if self.collect_timeline {
             self.cpu_slices_us.push(cpu_us);
+            self.cpu_wall_slices_us.push(cpu_wall_us);
         }
         if stop.load(Ordering::Relaxed) {
             return Poll::Ready(self.finish(true));
@@ -414,6 +429,9 @@ impl SimSubtask {
             schedule_waits_us: std::mem::take(&mut self.schedule_waits_us),
             cpu_us: self.cpu_us,
             cpu_slices_us: std::mem::take(&mut self.cpu_slices_us),
+            cpu_wall_us: self.cpu_wall_us,
+            cpu_wall_slices_us: std::mem::take(&mut self.cpu_wall_slices_us),
+            completed_at: Instant::now(),
             priority_snapshots: std::mem::take(&mut self.priority_snapshots),
         }
     }
@@ -627,6 +645,7 @@ async fn run_query(
     let mut total_schedule_wait = Duration::ZERO;
     let mut first_schedule_wait = Duration::ZERO;
     let mut acquire_wait = Duration::ZERO;
+    let mut rx_wake_delay = Duration::ZERO;
     let mut errors = 0usize;
     while let Some(result) = in_flight.next().await {
         let mut freed_lane = None;
@@ -638,6 +657,7 @@ async fn run_query(
                 }
                 freed_lane = Some(task.lane_index);
                 acquire_wait += task.acquire_wait;
+                rx_wake_delay += Duration::from_micros(task.rx_wake_delay_us);
                 total_schedule_wait += Duration::from_micros(task.total_schedule_wait_us);
                 first_schedule_wait += Duration::from_micros(task.first_schedule_wait_us);
                 if collect_timeline {
@@ -689,6 +709,7 @@ async fn run_query(
         total_schedule_wait,
         first_schedule_wait,
         acquire_wait,
+        rx_wake_delay,
         subtasks: task_count,
         errors,
         slow_query_latency: payload.slow_query_latency.0,
@@ -746,10 +767,14 @@ async fn spawn_subtask(
         .map_err(|_| ())?;
     let acquire_wait = acquire_started_at.elapsed();
     let result = rx.await.map_err(|_| ())?;
-    let elapsed = created_at.elapsed();
+    let received_at = Instant::now();
+    let elapsed = received_at.saturating_duration_since(created_at);
+    let rx_wake_delay_us = received_at
+        .saturating_duration_since(result.completed_at)
+        .as_micros() as u64;
     if !result.cancelled && result.cpu_us > 0 {
         let _ = events_tx.send(SimEvent::Cpu {
-            at: Instant::now(),
+            at: received_at,
             payload,
             cpu_us: result.cpu_us,
         });
@@ -766,6 +791,9 @@ async fn spawn_subtask(
         schedule_waits_us: result.schedule_waits_us,
         cpu_us: result.cpu_us,
         cpu_slices_us: result.cpu_slices_us,
+        cpu_wall_us: result.cpu_wall_us,
+        cpu_wall_slices_us: result.cpu_wall_slices_us,
+        rx_wake_delay_us,
         priority_snapshots: result.priority_snapshots,
     })
 }
@@ -973,6 +1001,7 @@ mod stats {
         total_schedule_wait_us: u64,
         first_schedule_wait_us: u64,
         acquire_wait_us: u64,
+        rx_wake_delay_us: u64,
         tasks: Vec<SlowQueryTaskSample>,
     }
 
@@ -985,6 +1014,9 @@ mod stats {
         acquire_wait_us: u64,
         cpu_us: u64,
         cpu_slices_us: Vec<u64>,
+        cpu_wall_us: u64,
+        cpu_wall_slices_us: Vec<u64>,
+        rx_wake_delay_us: u64,
         schedule_waits_us: Vec<u64>,
         priority_snapshots: Vec<Option<ReadFlowPrioritySnapshot>>,
     }
@@ -1113,14 +1145,16 @@ mod stats {
             let total_schedule_wait_us = event.total_schedule_wait.as_micros() as u64;
             let first_schedule_wait_us = event.first_schedule_wait.as_micros() as u64;
             let acquire_wait_us = event.acquire_wait.as_micros() as u64;
+            let rx_wake_delay_us = event.rx_wake_delay.as_micros() as u64;
             let latency_us = event.latency.as_micros() as u64;
             println!(
-                "slow query: payload={}, latency={:.2}ms, sched={:.2}ms, first_sched={:.2}ms, acquire={:.2}ms, tasks={}",
+                "slow query: payload={}, latency={:.2}ms, sched={:.2}ms, first_sched={:.2}ms, acquire={:.2}ms, rx_wake={:.2}ms, tasks={}",
                 event.payload,
                 latency_us as f64 / 1000.0,
                 total_schedule_wait_us as f64 / 1000.0,
                 first_schedule_wait_us as f64 / 1000.0,
                 acquire_wait_us as f64 / 1000.0,
+                rx_wake_delay_us as f64 / 1000.0,
                 event.tasks.as_ref().map_or(0, Vec::len)
             );
             let tasks = event.tasks.as_deref().unwrap_or(&[]);
@@ -1131,6 +1165,7 @@ mod stats {
                 total_schedule_wait_us,
                 first_schedule_wait_us,
                 acquire_wait_us,
+                rx_wake_delay_us,
                 tasks: tasks
                     .iter()
                     .map(|task| SlowQueryTaskSample {
@@ -1141,6 +1176,9 @@ mod stats {
                         acquire_wait_us: task.acquire_wait.as_micros() as u64,
                         cpu_us: task.cpu_us,
                         cpu_slices_us: task.cpu_slices_us.clone(),
+                        cpu_wall_us: task.cpu_wall_us,
+                        cpu_wall_slices_us: task.cpu_wall_slices_us.clone(),
+                        rx_wake_delay_us: task.rx_wake_delay_us,
                         schedule_waits_us: task.schedule_waits_us.clone(),
                         priority_snapshots: task.priority_snapshots.clone(),
                     })
@@ -1381,7 +1419,7 @@ mod stats {
     }
 
     fn report_style() -> &'static str {
-        r#"body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:32px;color:#1f2933}h1{margin-bottom:24px}section{margin:0 0 36px}h2{font-size:18px;margin:0 0 10px}pre{padding:12px;border:1px solid #d8dee4;background:#f6f8fa;overflow:auto}details{margin-top:10px}summary{cursor:pointer}.chart-wrap{height:320px;border:1px solid #d8dee4;padding:16px;background:#fff}.metric-table{margin-top:10px}.table-wrap{overflow:auto;border:1px solid #d8dee4;background:#fff}table{border-collapse:collapse;width:100%;font-size:13px}th,td{border:1px solid #d8dee4;padding:6px 8px;text-align:left;white-space:nowrap}th{background:#f6f8fa}.kv{display:inline-flex;align-items:baseline;margin:2px 6px 2px 0;border:1px solid #d8dee4;background:#f8fafc;border-radius:4px;overflow:hidden;font-size:12px;line-height:1.5}.kv-key{padding:1px 5px;color:#475569;background:#eef2f7;font-weight:600}.kv-value{padding:1px 6px;color:#0f172a;font-weight:500}.slow-query{border:1px solid #d8dee4;margin:0 0 16px;padding:12px;background:#fff}.slow-query summary{font-weight:600}.slow-detail{margin-top:12px}.slow-legend{margin:0 0 10px}.slow-viz{overflow:auto;padding:8px 0}.slow-overview{min-width:760px;border:1px solid #d8dee4;background:#fff}.time-axis-h{position:relative;margin-left:72px;height:28px;border-bottom:1px solid #cbd5e1}.time-tick-h{position:absolute;top:0;bottom:0;border-left:1px solid #cbd5e1;color:#64748b;font-size:11px}.time-tick-h span{position:relative;left:4px;top:2px;background:#fff;padding:0 2px}.lane-section{border-top:1px solid #e2e8f0}.lane-main{position:relative;height:42px}.lane-label{position:absolute;left:0;top:0;width:64px;height:100%;display:flex;align-items:center;justify-content:flex-end;padding-right:8px;color:#475569;font-size:12px}.lane-track{position:absolute;left:72px;right:0;top:7px;height:28px;background:#f8fafc;border-left:1px solid #cbd5e1}.lane-task-details{position:relative;margin-left:72px;margin-right:10px;margin-bottom:10px;padding-top:8px}.task-block{position:absolute;top:2px;height:24px;min-width:8px;border:2px solid #334155;background:#dbeafe;box-sizing:border-box;overflow:hidden;cursor:pointer}.task-block:hover:not(.is-selected){outline:2px dashed #64748b;z-index:3}.task-block.is-selected{border-color:#2563eb;box-shadow:0 0 0 4px rgba(37,99,235,.48);z-index:4}.task-overview-segment{position:absolute;top:0;bottom:0}.task-label{position:relative;z-index:1;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;font-weight:600;line-height:20px;padding:0 4px;color:#064e3b;text-shadow:0 1px 1px rgba(255,255,255,.8)}.task-detail{position:relative;display:none;border:1px solid #d8dee4;background:#f8fafc;padding:10px}.task-detail.is-active{display:block;border-color:#93c5fd;background:#eff6ff;box-shadow:0 2px 8px rgba(15,23,42,.08)}.detail-title{margin-bottom:8px}.detail-timeline{position:relative;height:32px;border:1px solid #cbd5e1;background:#fff}.slice-block{position:absolute;top:4px;height:22px;min-width:6px;border:1px solid #334155;background:#fff;box-sizing:border-box;cursor:pointer;overflow:hidden}.slice-block:hover:not(.is-selected){outline:2px dashed #64748b;z-index:2}.slice-block.is-selected{border-color:#2563eb;box-shadow:0 0 0 4px rgba(37,99,235,.48);z-index:3}.slice-segment{position:absolute;top:0;bottom:0}.slice-details{position:relative;margin-top:8px;padding-top:8px}.slice-detail{position:relative;display:none;border:1px solid #d8dee4;background:#fff;padding:8px}.slice-detail.is-active{display:block;border-color:#93c5fd;background:#eff6ff;box-shadow:0 2px 8px rgba(15,23,42,.08)}.slice-detail-title{margin-bottom:6px}.slice-timeline{position:relative;height:22px;border:1px solid #cbd5e1;background:#fff}.slice-detail-segment{position:absolute;top:0;bottom:0}.state-wait{background:#f97316}.state-cpu{background:#86efac}.state-other{background:#94a3b8}.legend-chip{display:inline-block;width:10px;height:10px;margin-right:4px;vertical-align:-1px}.muted{color:#64748b}"#
+        r#"body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;margin:32px;color:#1f2933}h1{margin-bottom:24px}section{margin:0 0 36px}h2{font-size:18px;margin:0 0 10px}pre{padding:12px;border:1px solid #d8dee4;background:#f6f8fa;overflow:auto}details{margin-top:10px}summary{cursor:pointer}.chart-wrap{height:320px;border:1px solid #d8dee4;padding:16px;background:#fff}.metric-table{margin-top:10px}.table-wrap{overflow:auto;border:1px solid #d8dee4;background:#fff}table{border-collapse:collapse;width:100%;font-size:13px}th,td{border:1px solid #d8dee4;padding:6px 8px;text-align:left;white-space:nowrap}th{background:#f6f8fa}.kv{display:inline-flex;align-items:baseline;margin:2px 6px 2px 0;border:1px solid #d8dee4;background:#f8fafc;border-radius:4px;overflow:hidden;font-size:12px;line-height:1.5}.kv-key{padding:1px 5px;color:#475569;background:#eef2f7;font-weight:600}.kv-value{padding:1px 6px;color:#0f172a;font-weight:500}.slow-query{border:1px solid #d8dee4;margin:0 0 16px;padding:12px;background:#fff}.slow-query summary{font-weight:600}.slow-detail{margin-top:12px}.slow-legend{margin:0 0 10px}.slow-viz{overflow:auto;padding:8px 0}.slow-overview{min-width:760px;border:1px solid #d8dee4;background:#fff}.time-axis-h{position:relative;margin-left:72px;height:28px;border-bottom:1px solid #cbd5e1}.time-tick-h{position:absolute;top:0;bottom:0;border-left:1px solid #cbd5e1;color:#64748b;font-size:11px}.time-tick-h span{position:relative;left:4px;top:2px;background:#fff;padding:0 2px}.lane-section{border-top:1px solid #e2e8f0}.lane-main{position:relative;height:42px}.lane-label{position:absolute;left:0;top:0;width:64px;height:100%;display:flex;align-items:center;justify-content:flex-end;padding-right:8px;color:#475569;font-size:12px}.lane-track{position:absolute;left:72px;right:0;top:7px;height:28px;background:#f8fafc;border-left:1px solid #cbd5e1}.lane-task-details{position:relative;margin-left:72px;margin-right:10px;margin-bottom:10px;padding-top:8px}.task-block{position:absolute;top:2px;height:24px;min-width:8px;border:2px solid #334155;background:#dbeafe;box-sizing:border-box;overflow:hidden;cursor:pointer}.task-block:hover:not(.is-selected){outline:2px dashed #64748b;z-index:3}.task-block.is-selected{border-color:#2563eb;box-shadow:0 0 0 4px rgba(37,99,235,.48);z-index:4}.task-overview-segment{position:absolute;top:0;bottom:0}.task-label{position:relative;z-index:1;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;font-weight:600;line-height:20px;padding:0 4px;color:#064e3b;text-shadow:0 1px 1px rgba(255,255,255,.8)}.task-detail{position:relative;display:none;border:1px solid #d8dee4;background:#f8fafc;padding:10px}.task-detail.is-active{display:block;border-color:#93c5fd;background:#eff6ff;box-shadow:0 2px 8px rgba(15,23,42,.08)}.detail-title{margin-bottom:8px}.detail-timeline{position:relative;height:32px;border:1px solid #cbd5e1;background:#fff}.slice-block{position:absolute;top:4px;height:22px;min-width:6px;border:1px solid #334155;background:#fff;box-sizing:border-box;cursor:pointer;overflow:hidden}.slice-block:hover:not(.is-selected){outline:2px dashed #64748b;z-index:2}.slice-block.is-selected{border-color:#2563eb;box-shadow:0 0 0 4px rgba(37,99,235,.48);z-index:3}.slice-segment{position:absolute;top:0;bottom:0}.slice-details{position:relative;margin-top:8px;padding-top:8px}.slice-detail{position:relative;display:none;border:1px solid #d8dee4;background:#fff;padding:8px}.slice-detail.is-active{display:block;border-color:#93c5fd;background:#eff6ff;box-shadow:0 2px 8px rgba(15,23,42,.08)}.slice-detail-title{margin-bottom:6px}.slice-timeline{position:relative;height:22px;border:1px solid #cbd5e1;background:#fff}.slice-detail-segment{position:absolute;top:0;bottom:0}.state-wait{background:#f97316}.state-cpu{background:#86efac}.state-cpu-gap{background:#cbd5e1}.state-rx{background:#a78bfa}.state-other{background:#94a3b8}.legend-chip{display:inline-block;width:10px;height:10px;margin-right:4px;vertical-align:-1px}.muted{color:#64748b}"#
     }
 
     fn resolve_report_path(report_path: &str) -> PathBuf {
@@ -1502,13 +1540,16 @@ mod stats {
             .map(render_slow_query)
             .collect::<String>();
         format!(
-            "<section><h2>Slow Queries</h2><p class=\"muted\"><span class=\"legend-chip state-wait\"></span>schedule wait <span class=\"legend-chip state-cpu\"></span>CPU <span class=\"legend-chip state-other\"></span>other</p>{}</section>",
+            "<section><h2>Slow Queries</h2><p class=\"muted\"><span class=\"legend-chip state-wait\"></span>schedule wait <span class=\"legend-chip state-cpu\"></span>CPU thread <span class=\"legend-chip state-cpu-gap\"></span>CPU wall gap <span class=\"legend-chip state-rx\"></span>rx wake <span class=\"legend-chip state-other\"></span>other</p>{}</section>",
             body
         )
     }
 
     fn render_slow_query(query: &SlowQuerySample) -> String {
         let total_cpu_us = query.tasks.iter().map(|task| task.cpu_us).sum::<u64>();
+        let total_cpu_wall_us = query.tasks.iter().map(|task| task.cpu_wall_us).sum::<u64>();
+        let total_cpu_gap_us = query.tasks.iter().map(task_cpu_wall_gap_us).sum::<u64>();
+        let total_rx_wake_us = query.rx_wake_delay_us;
         let lane_count = query
             .tasks
             .iter()
@@ -1526,7 +1567,10 @@ mod stats {
             ("sched", fmt_ms(query.total_schedule_wait_us)),
             ("first_sched", fmt_ms(query.first_schedule_wait_us)),
             ("cpu", fmt_ms(total_cpu_us)),
+            ("cpu_wall", fmt_ms(total_cpu_wall_us)),
+            ("cpu_gap", fmt_ms(total_cpu_gap_us)),
             ("acquire", fmt_ms(query.acquire_wait_us)),
+            ("rx_wake", fmt_ms(total_rx_wake_us)),
         ]);
         format!(
             "<details class=\"slow-query\"><summary>{}</summary><div class=\"slow-detail\">{}</div></details>",
@@ -1607,7 +1651,11 @@ mod stats {
     fn render_task_overview_segments(task: &SlowQueryTaskSample) -> String {
         let mut offset_us = 0u64;
         let mut segments = String::new();
-        let segment_count = task.schedule_waits_us.len().max(task.cpu_slices_us.len());
+        let segment_count = task
+            .schedule_waits_us
+            .len()
+            .max(task.cpu_slices_us.len())
+            .max(task.cpu_wall_slices_us.len());
         for index in 0..segment_count {
             if let Some(wait_us) = task.schedule_waits_us.get(index).copied() {
                 segments.push_str(&render_task_overview_segment(
@@ -1618,7 +1666,14 @@ mod stats {
                 ));
                 offset_us = offset_us.saturating_add(wait_us);
             }
-            if let Some(cpu_us) = task.cpu_slices_us.get(index).copied() {
+            let cpu_us = task.cpu_slices_us.get(index).copied().unwrap_or(0);
+            let cpu_wall_us = task
+                .cpu_wall_slices_us
+                .get(index)
+                .copied()
+                .unwrap_or(cpu_us)
+                .max(cpu_us);
+            if cpu_us > 0 {
                 segments.push_str(&render_task_overview_segment(
                     "state-cpu",
                     offset_us,
@@ -1627,6 +1682,25 @@ mod stats {
                 ));
                 offset_us = offset_us.saturating_add(cpu_us);
             }
+            let cpu_gap_us = cpu_wall_us.saturating_sub(cpu_us);
+            if cpu_gap_us > 0 {
+                segments.push_str(&render_task_overview_segment(
+                    "state-cpu-gap",
+                    offset_us,
+                    cpu_gap_us,
+                    task.elapsed_us,
+                ));
+                offset_us = offset_us.saturating_add(cpu_gap_us);
+            }
+        }
+        if task.rx_wake_delay_us > 0 {
+            segments.push_str(&render_task_overview_segment(
+                "state-rx",
+                offset_us,
+                task.rx_wake_delay_us,
+                task.elapsed_us,
+            ));
+            offset_us = offset_us.saturating_add(task.rx_wake_delay_us);
         }
         if task.elapsed_us > offset_us {
             segments.push_str(&render_task_overview_segment(
@@ -1671,26 +1745,49 @@ mod stats {
     fn render_task_slice_blocks(task: &SlowQueryTaskSample) -> String {
         let mut offset_us = 0u64;
         let mut blocks = String::new();
-        let segment_count = task.schedule_waits_us.len().max(task.cpu_slices_us.len());
+        let segment_count = task
+            .schedule_waits_us
+            .len()
+            .max(task.cpu_slices_us.len())
+            .max(task.cpu_wall_slices_us.len());
         for index in 0..segment_count {
             let wait_us = task.schedule_waits_us.get(index).copied().unwrap_or(0);
             let cpu_us = task.cpu_slices_us.get(index).copied().unwrap_or(0);
-            let duration_us = wait_us.saturating_add(cpu_us);
+            let cpu_wall_us = task
+                .cpu_wall_slices_us
+                .get(index)
+                .copied()
+                .unwrap_or(cpu_us)
+                .max(cpu_us);
+            let duration_us = wait_us.saturating_add(cpu_wall_us);
             blocks.push_str(&render_slice_block(
                 task,
                 index,
                 offset_us,
                 wait_us,
                 cpu_us,
+                cpu_wall_us,
                 task.elapsed_us,
             ));
             offset_us = offset_us.saturating_add(duration_us);
         }
+        if task.rx_wake_delay_us > 0 {
+            blocks.push_str(&render_terminal_slice_block(
+                offset_us,
+                task.rx_wake_delay_us,
+                task.elapsed_us,
+                "state-rx",
+                "rx wake",
+            ));
+            offset_us = offset_us.saturating_add(task.rx_wake_delay_us);
+        }
         if task.elapsed_us > offset_us {
-            blocks.push_str(&render_other_slice_block(
+            blocks.push_str(&render_terminal_slice_block(
                 offset_us,
                 task.elapsed_us - offset_us,
                 task.elapsed_us,
+                "state-other",
+                "other",
             ));
         }
         blocks
@@ -1702,9 +1799,12 @@ mod stats {
         offset_us: u64,
         wait_us: u64,
         cpu_us: u64,
+        cpu_wall_us: u64,
         total_us: u64,
     ) -> String {
-        let duration_us = wait_us.saturating_add(cpu_us);
+        let cpu_wall_us = cpu_wall_us.max(cpu_us);
+        let cpu_gap_us = cpu_wall_us.saturating_sub(cpu_us);
+        let duration_us = wait_us.saturating_add(cpu_wall_us);
         if duration_us == 0 || total_us == 0 {
             return String::new();
         }
@@ -1712,17 +1812,19 @@ mod stats {
         let width = (duration_us as f64 / total_us as f64 * 100.0).max(0.3);
         let wait_width = wait_us as f64 / duration_us as f64 * 100.0;
         let cpu_width = cpu_us as f64 / duration_us as f64 * 100.0;
+        let cpu_gap_width = cpu_gap_us as f64 / duration_us as f64 * 100.0;
         let priority_snapshot = task.priority_snapshots.get(slice_index).copied().flatten();
         let title = slice_title(
             task,
             slice_index,
             wait_us,
             cpu_us,
+            cpu_wall_us,
             duration_us,
             priority_snapshot,
         );
         format!(
-            "<div class=\"slice-block\" data-task-id=\"{}\" data-slice-id=\"{}\" style=\"left:{:.4}%;width:{:.4}%\" title=\"{}\"><span class=\"slice-segment state-wait\" style=\"left:0;width:{:.4}%\"></span><span class=\"slice-segment state-cpu\" style=\"left:{:.4}%;width:{:.4}%\"></span></div>",
+            "<div class=\"slice-block\" data-task-id=\"{}\" data-slice-id=\"{}\" style=\"left:{:.4}%;width:{:.4}%\" title=\"{}\"><span class=\"slice-segment state-wait\" style=\"left:0;width:{:.4}%\"></span><span class=\"slice-segment state-cpu\" style=\"left:{:.4}%;width:{:.4}%\"></span><span class=\"slice-segment state-cpu-gap\" style=\"left:{:.4}%;width:{:.4}%\"></span></div>",
             task_dom_id(task),
             slice_dom_id(task, slice_index),
             left,
@@ -1730,31 +1832,51 @@ mod stats {
             escape_html(&title),
             wait_width,
             wait_width,
-            cpu_width
+            cpu_width,
+            wait_width + cpu_width,
+            cpu_gap_width
         )
     }
 
-    fn render_other_slice_block(offset_us: u64, duration_us: u64, total_us: u64) -> String {
+    fn render_terminal_slice_block(
+        offset_us: u64,
+        duration_us: u64,
+        total_us: u64,
+        class_name: &str,
+        label: &str,
+    ) -> String {
         if duration_us == 0 || total_us == 0 {
             return String::new();
         }
         let left = offset_us as f64 / total_us as f64 * 100.0;
         let width = (duration_us as f64 / total_us as f64 * 100.0).max(0.3);
         format!(
-            "<div class=\"slice-block\" style=\"left:{:.4}%;width:{:.4}%\" title=\"other {}\"><span class=\"slice-segment state-other\" style=\"left:0;width:100%\"></span></div>",
+            "<div class=\"slice-block\" style=\"left:{:.4}%;width:{:.4}%\" title=\"{} {}\"><span class=\"slice-segment {}\" style=\"left:0;width:100%\"></span></div>",
             left,
             width.min(100.0 - left.min(100.0)),
-            fmt_ms(duration_us)
+            escape_html(label),
+            fmt_ms(duration_us),
+            class_name
         )
     }
 
     fn render_slice_detail_panels(task: &SlowQueryTaskSample) -> String {
         let mut panels = String::new();
-        let segment_count = task.schedule_waits_us.len().max(task.cpu_slices_us.len());
+        let segment_count = task
+            .schedule_waits_us
+            .len()
+            .max(task.cpu_slices_us.len())
+            .max(task.cpu_wall_slices_us.len());
         for index in 0..segment_count {
             let wait_us = task.schedule_waits_us.get(index).copied().unwrap_or(0);
             let cpu_us = task.cpu_slices_us.get(index).copied().unwrap_or(0);
-            let duration_us = wait_us.saturating_add(cpu_us);
+            let cpu_wall_us = task
+                .cpu_wall_slices_us
+                .get(index)
+                .copied()
+                .unwrap_or(cpu_us)
+                .max(cpu_us);
+            let duration_us = wait_us.saturating_add(cpu_wall_us);
             if duration_us == 0 {
                 continue;
             }
@@ -1766,17 +1888,24 @@ mod stats {
                     index,
                     wait_us,
                     cpu_us,
+                    cpu_wall_us,
                     duration_us,
                     task.priority_snapshots.get(index).copied().flatten(),
                 ),
-                render_slice_detail_segments(wait_us, cpu_us, duration_us)
+                render_slice_detail_segments(wait_us, cpu_us, cpu_wall_us, duration_us)
             ));
         }
         panels
     }
 
-    fn render_slice_detail_segments(wait_us: u64, cpu_us: u64, total_us: u64) -> String {
+    fn render_slice_detail_segments(
+        wait_us: u64,
+        cpu_us: u64,
+        cpu_wall_us: u64,
+        total_us: u64,
+    ) -> String {
         let mut segments = String::new();
+        let cpu_gap_us = cpu_wall_us.max(cpu_us).saturating_sub(cpu_us);
         if wait_us > 0 {
             segments.push_str(&render_slice_detail_segment(
                 "state-wait",
@@ -1793,6 +1922,15 @@ mod stats {
                 cpu_us,
                 total_us,
                 &format!("CPU {}", fmt_ms(cpu_us)),
+            ));
+        }
+        if cpu_gap_us > 0 {
+            segments.push_str(&render_slice_detail_segment(
+                "state-cpu-gap",
+                wait_us.saturating_add(cpu_us),
+                cpu_gap_us,
+                total_us,
+                &format!("CPU wall gap {}", fmt_ms(cpu_gap_us)),
             ));
         }
         segments
@@ -1847,12 +1985,16 @@ mod stats {
             ("start", fmt_ms(task.created_after_us)),
             ("elapsed", fmt_ms(task.elapsed_us)),
             ("cpu", fmt_ms(task.cpu_us)),
+            ("cpu_wall", fmt_ms(task.cpu_wall_us)),
+            ("cpu_gap", fmt_ms(task_cpu_wall_gap_us(task))),
             ("sched", fmt_ms(task.schedule_waits_us.iter().sum::<u64>())),
             (
                 "first_sched",
                 fmt_ms(task.schedule_waits_us.first().copied().unwrap_or(0)),
             ),
             ("acquire", fmt_ms(task.acquire_wait_us)),
+            ("rx_wake", fmt_ms(task.rx_wake_delay_us)),
+            ("other", fmt_ms(task_other_us(task))),
         ])
     }
 
@@ -1861,15 +2003,19 @@ mod stats {
         slice_index: usize,
         wait_us: u64,
         cpu_us: u64,
+        cpu_wall_us: u64,
         duration_us: u64,
         priority_snapshot: Option<ReadFlowPrioritySnapshot>,
     ) -> String {
+        let cpu_gap_us = cpu_wall_us.max(cpu_us).saturating_sub(cpu_us);
         let mut pairs = vec![
             ("Task", task.task_index.to_string()),
             ("Slice", slice_index.to_string()),
             ("total", fmt_ms(duration_us)),
             ("schedule_wait", fmt_ms(wait_us)),
             ("cpu", fmt_ms(cpu_us)),
+            ("cpu_wall", fmt_ms(cpu_wall_us)),
+            ("cpu_gap", fmt_ms(cpu_gap_us)),
         ];
         if let Some(snapshot) = priority_snapshot {
             pairs.extend([
@@ -1886,9 +2032,11 @@ mod stats {
         slice_index: usize,
         wait_us: u64,
         cpu_us: u64,
+        cpu_wall_us: u64,
         duration_us: u64,
         priority_snapshot: Option<ReadFlowPrioritySnapshot>,
     ) -> String {
+        let cpu_gap_us = cpu_wall_us.max(cpu_us).saturating_sub(cpu_us);
         let priority = priority_snapshot
             .map(|snapshot| {
                 format!(
@@ -1900,28 +2048,47 @@ mod stats {
             })
             .unwrap_or_default();
         format!(
-            "Task-{} Slice-{}\ntotal {}\nschedule wait {}\nCPU {}{}",
+            "Task-{} Slice-{}\ntotal {}\nschedule wait {}\nCPU thread {}\nCPU wall {}\nCPU wall gap {}{}",
             task.task_index,
             slice_index,
             fmt_ms(duration_us),
             fmt_ms(wait_us),
             fmt_ms(cpu_us),
+            fmt_ms(cpu_wall_us),
+            fmt_ms(cpu_gap_us),
             priority
         )
     }
 
     fn task_title(task: &SlowQueryTaskSample) -> String {
         format!(
-            "Task-{} Line-{}\nstart {}\nelapsed {}\ncpu {}\nacquire {}\nschedule waits [{}]\ncpu slices [{}]",
+            "Task-{} Line-{}\nstart {}\nelapsed {}\ncpu {}\ncpu wall {}\ncpu gap {}\nacquire {}\nrx wake {}\nother {}\nschedule waits [{}]\ncpu slices [{}]\ncpu wall slices [{}]",
             task.task_index,
             task.lane_index,
             fmt_ms(task.created_after_us),
             fmt_ms(task.elapsed_us),
             fmt_ms(task.cpu_us),
+            fmt_ms(task.cpu_wall_us),
+            fmt_ms(task_cpu_wall_gap_us(task)),
             fmt_ms(task.acquire_wait_us),
+            fmt_ms(task.rx_wake_delay_us),
+            fmt_ms(task_other_us(task)),
             format_us_list(&task.schedule_waits_us),
-            format_us_list(&task.cpu_slices_us)
+            format_us_list(&task.cpu_slices_us),
+            format_us_list(&task.cpu_wall_slices_us)
         )
+    }
+
+    fn task_cpu_wall_gap_us(task: &SlowQueryTaskSample) -> u64 {
+        task.cpu_wall_us.saturating_sub(task.cpu_us)
+    }
+
+    fn task_other_us(task: &SlowQueryTaskSample) -> u64 {
+        let schedule_wait_us = task.schedule_waits_us.iter().sum::<u64>();
+        task.elapsed_us
+            .saturating_sub(schedule_wait_us)
+            .saturating_sub(task.cpu_wall_us)
+            .saturating_sub(task.rx_wake_delay_us)
     }
 
     fn render_total_cpu_dataset(series: &BTreeMap<String, Vec<StatsSample>>) -> String {

@@ -115,6 +115,15 @@ struct ReadFlowTaskState {
     priority_us: AtomicU64,
 }
 
+fn raise_virtual_time_to_floor(virtual_time_us: &AtomicU64, floor_us: u64) -> u64 {
+    virtual_time_us
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |vt| {
+            (vt < floor_us).then_some(floor_us)
+        })
+        .unwrap_or_else(|vt| vt)
+        .max(floor_us)
+}
+
 struct FlowMapShard {
     flows: HashMap<ReadFlowId, Arc<ReadFlowState>>,
     flow_task_ids: HashMap<u64, Arc<ReadFlowTaskState>>,
@@ -201,6 +210,7 @@ impl FlowsMap {
     fn scan_min_virtual_time_us(
         &self,
         now_us: u64,
+        virtual_time_floor_us: u64,
         is_live: impl Fn(&ReadFlowState, u64) -> bool,
     ) -> u64 {
         let mut min_vt = u64::MAX;
@@ -208,7 +218,10 @@ impl FlowsMap {
             let shard = shard.read().unwrap();
             for state in shard.flows.values() {
                 if is_live(state, now_us) {
-                    min_vt = min_vt.min(state.virtual_time_us.load(Ordering::Relaxed));
+                    min_vt = min_vt.min(raise_virtual_time_to_floor(
+                        &state.virtual_time_us,
+                        virtual_time_floor_us,
+                    ));
                 }
             }
         }
@@ -240,6 +253,7 @@ pub struct ReadFlowController {
     flows: Arc<FlowsMap>,
     next_flow_task_seq: Arc<AtomicU64>,
     min_virtual_time_us: Arc<AtomicU64>,
+    max_virtual_time_us: Arc<AtomicU64>,
     min_virtual_time_updated_at_us: Arc<AtomicU64>,
     last_idle_gc_at_us: Arc<AtomicU64>,
     started_at: Arc<StdInstant>,
@@ -258,6 +272,7 @@ impl ReadFlowController {
             flows: Arc::new(FlowsMap::new()),
             next_flow_task_seq: Arc::new(AtomicU64::new(1)),
             min_virtual_time_us: Arc::new(AtomicU64::new(0)),
+            max_virtual_time_us: Arc::new(AtomicU64::new(0)),
             min_virtual_time_updated_at_us: Arc::new(AtomicU64::new(0)),
             last_idle_gc_at_us: Arc::new(AtomicU64::new(0)),
             started_at: Arc::new(StdInstant::now()),
@@ -272,7 +287,7 @@ impl ReadFlowController {
             return ReadFlowPermit::Noop;
         }
 
-        let initial_virtual_time_us = self.cached_min_virtual_time_us();
+        let initial_virtual_time_us = self.initial_virtual_time_us();
         let flow_task_id = self.next_flow_task_id(flow_id.shard_id());
         let (state, task_state) = self.flows.acquire(
             flow_id,
@@ -280,6 +295,8 @@ impl ReadFlowController {
             self.max_in_flight,
             initial_virtual_time_us,
         );
+        let virtual_time_us = self.raise_flow_virtual_time_to_floor(&state);
+        raise_virtual_time_to_floor(&task_state.priority_us, virtual_time_us);
         let semaphore = state.semaphore.clone();
         let flow_ref = ReadFlowRef {
             controller: self.clone(),
@@ -327,14 +344,7 @@ impl ReadFlowController {
 
     fn flow_priority_snapshot(&self, state: &ReadFlowState) -> ReadFlowPrioritySnapshot {
         let min_vt = self.cached_min_virtual_time_us();
-        let max_vt = min_vt.saturating_add(MAX_READ_FLOW_VIRTUAL_TIME_LAG_US);
-        let vt = state
-            .virtual_time_us
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |vt| {
-                (vt > max_vt).then_some(max_vt)
-            })
-            .unwrap_or_else(|vt| vt);
-        let virtual_time_us = vt.min(max_vt);
+        let virtual_time_us = self.raise_flow_virtual_time_to_floor(state);
         ReadFlowPrioritySnapshot {
             virtual_time_us,
             min_virtual_time_us: min_vt,
@@ -344,8 +354,8 @@ impl ReadFlowController {
 
     fn task_priority_snapshot(&self, task_state: &ReadFlowTaskState) -> ReadFlowPrioritySnapshot {
         let min_vt = self.cached_min_virtual_time_us();
-        let max_vt = min_vt.saturating_add(MAX_READ_FLOW_VIRTUAL_TIME_LAG_US);
-        let vt = task_state.priority_us.load(Ordering::Acquire).min(max_vt);
+        self.raise_flow_virtual_time_to_floor(&task_state.flow);
+        let vt = raise_virtual_time_to_floor(&task_state.priority_us, self.virtual_time_floor_us());
         ReadFlowPrioritySnapshot {
             virtual_time_us: vt,
             min_virtual_time_us: min_vt,
@@ -355,6 +365,31 @@ impl ReadFlowController {
 
     fn cached_min_virtual_time_us(&self) -> u64 {
         self.min_virtual_time_us.load(Ordering::Acquire)
+    }
+
+    fn virtual_time_floor_us(&self) -> u64 {
+        self.max_virtual_time_us
+            .load(Ordering::Acquire)
+            .saturating_sub(MAX_READ_FLOW_VIRTUAL_TIME_LAG_US)
+    }
+
+    fn initial_virtual_time_us(&self) -> u64 {
+        self.cached_min_virtual_time_us()
+            .max(self.virtual_time_floor_us())
+    }
+
+    fn raise_flow_virtual_time_to_floor(&self, state: &ReadFlowState) -> u64 {
+        raise_virtual_time_to_floor(&state.virtual_time_us, self.virtual_time_floor_us())
+    }
+
+    fn update_max_virtual_time_us(&self, virtual_time_us: u64) {
+        let _ = self.max_virtual_time_us.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |max_virtual_time_us| {
+                (virtual_time_us > max_virtual_time_us).then_some(virtual_time_us)
+            },
+        );
     }
 
     fn refresh_min_virtual_time_and_gc(&self) {
@@ -374,10 +409,11 @@ impl ReadFlowController {
     }
 
     fn scan_min_virtual_time_us_at(&self, now_us: u64) -> u64 {
-        self.flows
-            .scan_min_virtual_time_us(now_us, |state, now_us| {
-                Self::is_active_or_recent_idle(state, now_us)
-            })
+        self.flows.scan_min_virtual_time_us(
+            now_us,
+            self.virtual_time_floor_us(),
+            |state, now_us| Self::is_active_or_recent_idle(state, now_us),
+        )
     }
 
     fn is_active_or_recent_idle(state: &ReadFlowState, now_us: u64) -> bool {
@@ -486,18 +522,28 @@ impl ReadFlowPermit {
 
     fn charge_us(&self, delta: u64) {
         let ReadFlowPermit::Limited {
-            state, task_state, ..
+            flow_ref,
+            state,
+            task_state,
+            ..
         } = self
         else {
             return;
         };
+        let Some(flow_ref) = flow_ref else {
+            return;
+        };
+        let floor_us = flow_ref.controller.virtual_time_floor_us();
         let charged_to_vt = state
             .virtual_time_us
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |vt| {
-                Some(vt.saturating_add(delta))
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |vt| {
+                Some(vt.max(floor_us).saturating_add(delta))
             })
-            .map(|old_vt| old_vt.saturating_add(delta))
+            .map(|old_vt| old_vt.max(floor_us).saturating_add(delta))
             .unwrap_or_else(|old_vt| old_vt);
+        flow_ref
+            .controller
+            .update_max_virtual_time_us(charged_to_vt);
         task_state
             .priority_us
             .store(charged_to_vt, Ordering::Release);
@@ -2528,7 +2574,7 @@ mod tests {
         let flow2_first = block_on(controller.acquire(Some(flow2)));
         let flow1_task_id = flow1_first.yatp_task_id(1);
         let flow2_task_id = flow2_first.yatp_task_id(2);
-        assert_ne!(flow1_task_id, flow1.yatp_task_id());
+        assert_ne!(flow1_task_id, flow2_task_id);
         assert_eq!(
             controller.flow_priority_tag_by_task_id(flow1_task_id),
             Some(0)
@@ -2538,11 +2584,11 @@ mod tests {
 
         assert_eq!(
             controller.flow_priority_tag_by_task_id(flow2_task_id),
-            Some(0)
+            Some(Duration::from_millis(500).as_micros() as u64)
         );
         assert_eq!(
             controller.flow_priority_tag_by_task_id(flow1_task_id),
-            Some(MAX_READ_FLOW_VIRTUAL_TIME_LAG_US)
+            Some(Duration::from_millis(1500).as_micros() as u64)
         );
 
         drop(flow2_first);
@@ -2551,11 +2597,11 @@ mod tests {
         let flow3_task_id = flow3_first.yatp_task_id(3);
         assert_eq!(
             controller.flow_priority_tag_by_task_id(flow3_task_id),
-            Some(0)
+            Some(Duration::from_millis(500).as_micros() as u64)
         );
         assert_eq!(
             controller.flow_priority_tag_by_task_id(flow1_task_id),
-            Some(MAX_READ_FLOW_VIRTUAL_TIME_LAG_US)
+            Some(Duration::from_millis(1500).as_micros() as u64)
         );
     }
 
@@ -2725,10 +2771,7 @@ mod tests {
         let mut cx = Context::from_waker(&waker);
         assert!(tracked_future.as_mut().poll(&mut cx).is_ready());
         assert_eq!(gauge.get(), 0);
-        assert_eq!(
-            controller.flow_priority_tag_by_task_id(flow_task_id),
-            Some(Duration::from_millis(50).as_micros() as u64)
-        );
+        assert_eq!(controller.flow_priority_tag_by_task_id(flow_task_id), None);
     }
 
     #[test]
@@ -2784,10 +2827,7 @@ mod tests {
 
         assert!(tracked_future.as_mut().poll(&mut cx).is_ready());
         assert_eq!(gauge.get(), 0);
-        assert_eq!(
-            controller.flow_priority_tag_by_task_id(flow_task_id),
-            Some(Duration::from_millis(100).as_micros() as u64)
-        );
+        assert_eq!(controller.flow_priority_tag_by_task_id(flow_task_id), None);
     }
 
     #[test]
